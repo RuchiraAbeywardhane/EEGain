@@ -4,7 +4,7 @@
     <br/>
     <a href="LICENSE"><img alt="CC BY 4.0 License" src="https://img.shields.io/badge/license-CC BY 4.0-blue.svg" /></a>
     <a><img alt="Latest Release" src="https://img.shields.io/badge/version-1.0.0-orange" /></a>
-    <a href=""><img alt="Paper" src="https://img.shields.io/badge/Paper-Link-green" /></a>
+    <a href="https://arxiv.org/abs/2505.18175"><img alt="Paper" src="https://img.shields.io/badge/Paper pre print-Link-green" /></a>
 </p>
 
 ---
@@ -417,3 +417,14 @@ python run_cli.py \
 This code repository is licensed under the [CC BY 4.0 License](LICENSE).
 
 ### **8. Citation**:
+```
+@misc{kukhilava2025evaluationeegemotionrecognition,
+      title={Evaluation in EEG Emotion Recognition: State-of-the-Art Review and Unified Framework}, 
+      author={Natia Kukhilava and Tatia Tsmindashvili and Rapael Kalandadze and Anchit Gupta and Sofio Katamadze and François Brémond and Laura M. Ferrari and Philipp Müller and Benedikt Emanuel Wirth},
+      year={2025},
+      eprint={2505.18175},
+      archivePrefix={arXiv},
+      primaryClass={eess.SP},
+      url={https://arxiv.org/abs/2505.18175}, 
+}
+```
