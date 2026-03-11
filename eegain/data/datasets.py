@@ -154,8 +154,8 @@ class SeedIV(EEGDataset):
             label_array(Dict[str, int]): labels for each recording
         """
 
-        labels_file_path = self.root / Path("ReadMe.txt")
-        path_to_channels_excel = self.root / Path("Channel Order.xlsx")
+        labels_file_path = self.root.parent / Path("ReadMe.txt")
+        path_to_channels_excel = self.root.parent / Path("Channel Order.xlsx")
         channels_file = pd.read_excel(path_to_channels_excel, header=None)
         channels = list(channels_file.iloc[:, 0])
 
@@ -210,8 +210,8 @@ class SeedIV(EEGDataset):
 
 
     def __get_trials__(self, sessions, subject_ids):
-        labels_file_path = self.root / Path("ReadMe.txt")
-        path_to_channels_excel = self.root / Path("Channel Order.xlsx")
+        labels_file_path = self.root.parent / Path("ReadMe.txt")
+        path_to_channels_excel = self.root.parent / Path("Channel Order.xlsx")
         channels_file = pd.read_excel(path_to_channels_excel, header=None)
         channels = list(channels_file.iloc[:, 0])
 
