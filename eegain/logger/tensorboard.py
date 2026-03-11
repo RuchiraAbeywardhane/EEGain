@@ -124,59 +124,38 @@ class EmotionLogger:
             loss=None,
     ):
         accuracy = accuracy_score(test_actual, test_pred)
-        self.log_metric(
-            subject_id, "accuracy",
-            accuracy, i, data_part
-        )
+        self.log_metric(subject_id, "accuracy", accuracy, i, data_part)
+
         f1 = f1_score(test_actual, test_pred, average='binary' if self.num_class <= 2 else 'macro')
-        self.log_metric(
-                subject_id, "f1",
-                f1, i, data_part
-            )
+        self.log_metric(subject_id, "f1", f1, i, data_part)
+
         f1_wtd = f1_score(test_actual, test_pred, average='weighted')
-        self.log_metric(
-            subject_id, "f1_weighted",
-            f1_wtd, i, data_part
-        )
+        self.log_metric(subject_id, "f1_weighted", f1_wtd, i, data_part)
+
         recall = recall_score(test_actual, test_pred, average='binary' if self.num_class <= 2 else 'macro')
-        self.log_metric(
-            subject_id, "recall",
-            recall, i, data_part
-        )
+        self.log_metric(subject_id, "recall", recall, i, data_part)
+
         precision = precision_score(test_actual, test_pred, average='binary' if self.num_class <= 2 else 'macro')
-        self.log_metric(
-            subject_id,
-            "precision",
-            precision, i,
-            data_part
-        )
-        
-        self.log_metric(
-            subject_id, "kappa",
-            cohen_kappa_score(test_actual, test_pred), i, data_part
-        )
-        # self.log_metric(
-        #     subject_id, "roc_auc",
-        #     roc_auc_score(test_actual, test_pred, average='binary' if self.num_class <= 2 else 'weighted', multi_class='ovr'), i, data_part
-        # )
-        self.log_metric(
-            subject_id,
-            "matthews_corrcoef",
-            matthews_corrcoef(test_actual, test_pred), i, data_part
-        )
-        self.log_metric(
-            subject_id,
-            "confusion_matrix",
-            confusion_matrix(test_actual, test_pred), i, data_part
-        )
+        self.log_metric(subject_id, "precision", precision, i, data_part)
+
+        self.log_metric(subject_id, "kappa", cohen_kappa_score(test_actual, test_pred), i, data_part)
+
+        self.log_metric(subject_id, "matthews_corrcoef", matthews_corrcoef(test_actual, test_pred), i, data_part)
+
+        cm = confusion_matrix(test_actual, test_pred)
+        self.log_metric(subject_id, "confusion_matrix", cm, i, data_part)
+
+        # --- Per-class accuracy (only for test data) ---
+        if data_part == "test":
+            per_class_acc = cm.diagonal() / cm.sum(axis=1)
+            for idx, acc in enumerate(per_class_acc):
+                class_name = self.class_names[idx] if idx < len(self.class_names) else str(idx)
+                metric_name = f"class_accuracy/{class_name}"
+                self.log_metric(subject_id, metric_name, acc, i, data_part)
+
         if loss:
-            self.log_metric(
-                subject_id,
-                "loss",
-                loss, i, data_part
-            )
-        
-        
+            self.log_metric(subject_id, "loss", loss, i, data_part)
+
     def log_each_user_metrics(self, metric_names: list[str]):
         metrics_for_each_subject = {}
         for subject_id, subject_logger in self.subject_loggers.items():
@@ -200,7 +179,6 @@ class EmotionLogger:
 
         with open(kwargs["overal_log_file"], 'a') as file:
             file.write("=" * 100 + "\n")
-            #file.write(f"log_dir={kwargs['log_dir']}\n")
             file.write(" ".join([f"{k}={v}" for k, v in kwargs.items()]) + "\n")
 
             for metric_name in metric_names:
@@ -214,6 +192,43 @@ class EmotionLogger:
                 self.writer.add_scalar(f"Overall/{metric_name}", metric_average)
                 file.write(f"{metric_name}={metric_average}\n")
                 file.write(f"{metric_name}_std={metric_std}\n")
+
+            # --- Per-class accuracy across all subjects ---
+            file.write("\n--- Per-Class Test Accuracy (per subject) ---\n")
+            for subject_id, metrics in metrics_for_each_subject.items():
+                file.write(f"  Subject {subject_id}:\n")
+                for idx, class_name in enumerate(self.class_names):
+                    key = f"class_accuracy/{class_name}"
+                    if key in metrics and len(metrics[key]) > 0:
+                        file.write(f"    {class_name}: {metrics[key][-1]:.4f}\n")
+
+            # --- Per-class accuracy averaged over all subjects ---
+            file.write("\n--- Per-Class Test Accuracy (averaged over subjects) ---\n")
+            for idx, class_name in enumerate(self.class_names):
+                key = f"class_accuracy/{class_name}"
+                values = [
+                    metrics[key][-1]
+                    for metrics in metrics_for_each_subject.values()
+                    if key in metrics and len(metrics[key]) > 0
+                ]
+                if values:
+                    avg = np.mean(values)
+                    std = np.std(values)
+                    file.write(f"  {class_name}: {avg:.4f} ± {std:.4f}\n")
+
+            # --- Confusion matrix per subject ---
+            file.write("\n--- Test Confusion Matrix (per subject) ---\n")
+            for subject_id, metrics in metrics_for_each_subject.items():
+                if "confusion_matrix" in metrics and len(metrics["confusion_matrix"]) > 0:
+                    cm = metrics["confusion_matrix"][-1]
+                    file.write(f"  Subject {subject_id}:\n")
+                    header = "          " + "  ".join([f"{c:>10}" for c in self.class_names])
+                    file.write(header + "\n")
+                    for row_idx, row in enumerate(cm):
+                        row_name = self.class_names[row_idx] if row_idx < len(self.class_names) else str(row_idx)
+                        row_str = f"  {row_name:>8}  " + "  ".join([f"{v:>10}" for v in row])
+                        file.write(row_str + "\n")
+                    file.write("\n")
 
     def log_summary(self, **kwargs):
         self.log_each_user_metrics(
