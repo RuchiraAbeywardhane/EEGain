@@ -30,6 +30,24 @@ def setup_seed(seed):
     np.random.seed(seed)
     # torch.backends.cudnn.benchmark = False  # if benchmark=True, deterministic will be False
     # torch.backends.cudnn.enabled = False
+
+def compute_class_weights(train_dataloader, num_classes):
+    """
+    Compute inverse-frequency class weights from the training dataloader.
+    Returns a normalized weight tensor on the correct device.
+    """
+    all_labels = train_dataloader.dataset.y
+    if isinstance(all_labels, torch.Tensor):
+        all_labels = all_labels.long()
+    else:
+        all_labels = torch.tensor(all_labels).long()
+
+    counts = torch.bincount(all_labels, minlength=num_classes).float()
+    # avoid division by zero for classes with no samples
+    counts = counts.clamp(min=1)
+    weights = 1.0 / counts
+    weights = weights / weights.sum()
+    return weights.to(device)
     
 def test_one_epoch(model, loader, loss_fn, val=False):
     model.eval()
@@ -369,7 +387,8 @@ def main_loto(dataset, model, empty_model, classes, **kwargs):
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=0)
                 is_random = False
                 
-            loss_fn = nn.CrossEntropyLoss(label_smoothing=kwargs["label_smoothing"])
+            class_weights = compute_class_weights(loader["train"], len(classes))
+            loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=kwargs["label_smoothing"])
             
             # Call the modified run_loto with validation data
             train_pred, train_actual, test_pred, test_actual = run_loto(
@@ -422,7 +441,8 @@ def loso_loop(model, loader, logger, **kwargs):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=0)
 
         is_random = False
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=kwargs["label_smoothing"])
+    class_weights = compute_class_weights(loader["train"], kwargs["num_classes"])
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=kwargs["label_smoothing"])
     
     if kwargs["model_name"]=="RANDOM_most_occurring" or kwargs["model_name"]=="RANDOM_class_distribution":
         num_epoch = 1
