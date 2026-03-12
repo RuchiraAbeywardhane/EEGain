@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import mne
 import torch
 import pickle
@@ -1079,5 +1080,290 @@ class Seed(EEGDataset):
         data_array = {
             key: np.expand_dims(value, axis=-3) for key, value in data_array.items()
         }
+
+        return data_array, label_array
+
+
+class Emognition(EEGDataset):
+    """
+    Dataset class for the Emognition dataset (MUSE headband EEG).
+
+    Directory structure expected:
+        <root>/
+            <SUBJECT>_<EMOTION>_STIMULUS_MUSE.json   (trial files)
+            <SUBJECT>_BASELINE_STIMULUS_MUSE.json     (optional baseline)
+
+    Each JSON file contains keys:
+        RAW_TP9, RAW_AF7, RAW_AF8, RAW_TP10  – raw EEG channels
+        HSI_TP9, HSI_AF7, HSI_AF8, HSI_TP10  – headset signal quality (1=good)
+        HeadBandOn                             – headband contact flag
+
+    SUPERCLASS_MAP maps raw emotion folder names to integer class labels.
+    """
+
+    # Default emotion -> class mapping (can be overridden via config)
+    DEFAULT_SUPERCLASS_MAP = {
+        "BOREDOM":  0,
+        "NEUTRAL":  1,
+        "NEGATIVE": 2,
+        "POSITIVE": 3,
+    }
+
+    EEG_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
+
+    @staticmethod
+    def _to_num(x):
+        if isinstance(x, list):
+            if not x:
+                return np.array([], np.float64)
+            if isinstance(x[0], str):
+                return pd.to_numeric(pd.Series(x), errors="coerce").to_numpy(np.float64)
+            return np.asarray(x, np.float64)
+        return np.asarray([x], np.float64)
+
+    @staticmethod
+    def _interp_nan(a):
+        a = a.astype(np.float64, copy=True)
+        m = np.isfinite(a)
+        if m.all():
+            return a
+        if not m.any():
+            return np.zeros_like(a)
+        idx = np.arange(len(a))
+        a[~m] = np.interp(idx[~m], idx[m], a[m])
+        return a
+
+    @staticmethod
+    def _create_user_recording_mapping(data_path: Path, superclass_map: dict) -> Dict[str, List[str]]:
+        """
+        Scan the data directory and build:
+            subject_id -> [list of JSON trial file paths]
+
+        Baseline files (containing 'BASELINE') are excluded from trials.
+        """
+        patterns = [
+            str(data_path / "*_STIMULUS_MUSE.json"),
+            str(data_path / "*" / "*_STIMULUS_MUSE.json"),
+            str(data_path / "*" / "*" / "*_STIMULUS_MUSE.json"),
+        ]
+        import glob as _glob
+        files = sorted({p for pat in patterns for p in _glob.glob(pat)})
+
+        user_session_info: Dict[str, List[str]] = defaultdict(list)
+        for fpath in files:
+            fname = os.path.basename(fpath)
+            parts = fname.split("_")
+            if len(parts) < 2:
+                continue
+            if "BASELINE" in fname:
+                continue
+            subject = parts[0]
+            emotion = parts[1].upper()
+            if emotion not in superclass_map:
+                continue
+            user_session_info[subject].append(fpath)
+
+        return dict(user_session_info)
+
+    @staticmethod
+    def _load_baseline(data_path: Path, subject: str) -> np.ndarray:
+        """Load and return baseline signal (T, 4) for a subject, or None."""
+        import glob as _glob
+        patterns = [
+            str(data_path / f"{subject}_BASELINE_STIMULUS_MUSE.json"),
+            str(data_path / subject / f"{subject}_BASELINE_STIMULUS_MUSE.json"),
+        ]
+        for pat in patterns:
+            matches = _glob.glob(pat)
+            if matches:
+                try:
+                    with open(matches[0], "r") as f:
+                        data = json.load(f)
+                    tp9  = Emognition._interp_nan(Emognition._to_num(data.get("RAW_TP9",  [])))
+                    af7  = Emognition._interp_nan(Emognition._to_num(data.get("RAW_AF7",  [])))
+                    af8  = Emognition._interp_nan(Emognition._to_num(data.get("RAW_AF8",  [])))
+                    tp10 = Emognition._interp_nan(Emognition._to_num(data.get("RAW_TP10", [])))
+                    L = min(len(tp9), len(af7), len(af8), len(tp10))
+                    if L > 0:
+                        sig = np.stack([tp9[:L], af7[:L], af8[:L], tp10[:L]], axis=1)
+                        return sig - sig.mean(axis=0, keepdims=True)
+                except Exception:
+                    pass
+        return None
+
+    @staticmethod
+    def _read_trial(fpath: str, use_baseline: bool, baseline: np.ndarray) -> np.ndarray:
+        """
+        Load one JSON trial file, apply quality filtering and optional baseline
+        reduction.  Returns raw signal (T, 4) as float32, or None if unusable.
+        """
+        with open(fpath, "r") as f:
+            data = json.load(f)
+
+        tp9  = Emognition._interp_nan(Emognition._to_num(data.get("RAW_TP9",  [])))
+        af7  = Emognition._interp_nan(Emognition._to_num(data.get("RAW_AF7",  [])))
+        af8  = Emognition._interp_nan(Emognition._to_num(data.get("RAW_AF8",  [])))
+        tp10 = Emognition._interp_nan(Emognition._to_num(data.get("RAW_TP10", [])))
+        L = min(len(tp9), len(af7), len(af8), len(tp10))
+        if L == 0:
+            return None
+
+        # Quality mask (HSI ≤ 2 and headband on)
+        hsi_tp9  = Emognition._to_num(data.get("HSI_TP9",  []))[:L]
+        hsi_af7  = Emognition._to_num(data.get("HSI_AF7",  []))[:L]
+        hsi_af8  = Emognition._to_num(data.get("HSI_AF8",  []))[:L]
+        hsi_tp10 = Emognition._to_num(data.get("HSI_TP10", []))[:L]
+        head_on  = Emognition._to_num(data.get("HeadBandOn", []))[:L]
+
+        mask = np.isfinite(tp9[:L]) & np.isfinite(af7[:L]) & np.isfinite(af8[:L]) & np.isfinite(tp10[:L])
+        if len(head_on) == L and len(hsi_tp9) == L:
+            mask &= (
+                (head_on == 1) &
+                np.isfinite(hsi_tp9)  & (hsi_tp9  <= 2) &
+                np.isfinite(hsi_af7)  & (hsi_af7  <= 2) &
+                np.isfinite(hsi_af8)  & (hsi_af8  <= 2) &
+                np.isfinite(hsi_tp10) & (hsi_tp10 <= 2)
+            )
+
+        tp9, af7, af8, tp10 = tp9[:L][mask], af7[:L][mask], af8[:L][mask], tp10[:L][mask]
+        L = len(tp9)
+        if L == 0:
+            return None
+
+        signal = np.stack([tp9, af7, af8, tp10], axis=1).astype(np.float64)
+        signal -= signal.mean(axis=0, keepdims=True)
+
+        # Optional InvBase baseline reduction
+        if use_baseline and baseline is not None:
+            common = min(L, len(baseline))
+            sig_t = signal[:common]
+            bas_t = baseline[:common]
+            eps = 1e-12
+            FFT_sig = np.fft.rfft(sig_t, axis=0)
+            FFT_bas = np.fft.rfft(bas_t, axis=0)
+            signal = np.fft.irfft(FFT_sig / (np.abs(FFT_bas) + eps),
+                                  n=common, axis=0)
+
+        return signal.astype(np.float32)
+
+    # ------------------------------------------------------------------
+
+    def __init__(
+        self,
+        root: str,
+        label_type: str = "V",          # kept for API compatibility, unused
+        ground_truth_threshold=None,     # kept for API compatibility, unused
+        transform: "Construct" = None,
+        superclass_map: dict = None,
+        use_baseline_reduction: bool = False,
+        sampling_r: int = 256,
+        **kwargs,
+    ):
+        self.root = Path(root)
+        self.transform = transform
+        self.superclass_map = superclass_map or Emognition.DEFAULT_SUPERCLASS_MAP
+        self.use_baseline_reduction = use_baseline_reduction
+        self.sampling_r = sampling_r
+        self._ch_names = [f"EEG{i:03d}" for i in range(4)]   # TP9 AF7 AF8 TP10
+        self.mapping_list = Emognition._create_user_recording_mapping(
+            self.root, self.superclass_map
+        )
+
+        logger.info(f"Using Dataset: {self.__class__.__name__}")
+        logger.info(f"Found {len(self.mapping_list)} subjects")
+
+    # ------------------------------------------------------------------
+    # Required EEGDataset interface
+    # ------------------------------------------------------------------
+
+    def __get_subject_ids__(self) -> List[str]:
+        return list(self.mapping_list.keys())
+
+    def __get_subject__(
+        self, subject_index: str
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, int]]:
+        """Return all trials for one subject as pipeline-compatible dicts."""
+        trial_paths = self.mapping_list[subject_index]
+
+        baseline = None
+        if self.use_baseline_reduction:
+            baseline = Emognition._load_baseline(self.root, subject_index)
+
+        data_array: Dict[str, np.ndarray] = {}
+        label_array: Dict[str, int] = {}
+
+        for fpath in trial_paths:
+            fname = os.path.basename(fpath)
+            parts = fname.split("_")
+            emotion = parts[1].upper()
+            label = self.superclass_map[emotion]
+
+            signal = Emognition._read_trial(fpath, self.use_baseline_reduction, baseline)
+            if signal is None:
+                logger.warning(f"Skipping empty trial: {fname}")
+                continue
+
+            # Convert (T, 4) → MNE RawArray so transforms work
+            info = mne.create_info(
+                ch_names=self.EEG_CHANNELS,
+                sfreq=self.sampling_r,
+                ch_types="eeg",
+            )
+            # MNE expects (C, T)
+            raw = mne.io.RawArray(signal.T, info, verbose=False)
+
+            if self.transform:
+                raw = self.transform(raw)
+
+            # Shape after transform + get_data(): (C, T)
+            # Pipeline expects (1, C, T) — expand batch dim
+            eeg = np.expand_dims(raw.get_data(), axis=0)   # (1, C, T)
+            data_array[fpath] = eeg
+            label_array[fpath] = label
+
+        logger.debug(
+            f"Subject {subject_index}: {len(data_array)} trials loaded"
+        )
+        return data_array, label_array
+
+    def __get_trials__(
+        self, sessions: List[str], subject_ids
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, int]]:
+        """Return specific trials (identified by file path) for LOTO splits."""
+        # sessions here are file paths (same keys used in mapping_list values)
+        subject = os.path.basename(sessions[0]).split("_")[0] if sessions else ""
+
+        baseline = None
+        if self.use_baseline_reduction:
+            baseline = Emognition._load_baseline(self.root, subject)
+
+        data_array: Dict[str, np.ndarray] = {}
+        label_array: Dict[str, int] = {}
+
+        for fpath in sessions:
+            fname = os.path.basename(fpath)
+            parts = fname.split("_")
+            emotion = parts[1].upper()
+            label = self.superclass_map.get(emotion)
+            if label is None:
+                continue
+
+            signal = Emognition._read_trial(fpath, self.use_baseline_reduction, baseline)
+            if signal is None:
+                continue
+
+            info = mne.create_info(
+                ch_names=self.EEG_CHANNELS,
+                sfreq=self.sampling_r,
+                ch_types="eeg",
+            )
+            raw = mne.io.RawArray(signal.T, info, verbose=False)
+
+            if self.transform:
+                raw = self.transform(raw)
+
+            eeg = np.expand_dims(raw.get_data(), axis=0)
+            data_array[fpath] = eeg
+            label_array[fpath] = label
 
         return data_array, label_array

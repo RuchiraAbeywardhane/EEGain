@@ -62,6 +62,17 @@ class SeedConfig:
     n_classes: int = 3
 
 @dataclass
+class EmognitionConfig:
+    data_path: str = ""
+    label_type: str = "V"          # unused, kept for API compatibility
+    split_type: str = "LOSO"
+    class_names: list[str] = field(default_factory=lambda: ["boredom", "neutral", "negative", "positive"])
+    ground_truth_threshold: float = 0.0   # unused
+    n_classes: int = 4
+    use_baseline_reduction: bool = False
+    sampling_r: int = 256
+
+@dataclass
 class TrainingConfig:
     batch_size: int = 32
     lr: float = 1e-4
@@ -98,4 +109,4 @@ class  DeepConvNetConfig:
 class ShallowConvNetConfig:
     channels: int = 32
     num_classes: int = 2
-    dropout_rate: int = 0.5   
+    dropout_rate: int = 0.5

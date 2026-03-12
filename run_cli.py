@@ -10,7 +10,7 @@ import config
 import click
 import eegain
 from eegain.data import EEGDataloader
-from eegain.data.datasets import DEAP, MAHNOB, SeedIV, AMIGOS, DREAMER, Seed
+from eegain.data.datasets import DEAP, MAHNOB, SeedIV, AMIGOS, DREAMER, Seed, Emognition
 from eegain.logger import EmotionLogger
 from eegain.models import DeepConvNet, EEGNet, ShallowConvNet, TSception
 from collections import defaultdict
@@ -99,6 +99,12 @@ Seed_transform =  [
         eegain.transforms.Resample(sampling_r=128),
     ]
 
+Emognition_transform = [
+    eegain.transforms.Filter(l_freq=0.3, h_freq=45),
+    eegain.transforms.NotchFilter(freq=50),
+    eegain.transforms.Resample(sampling_r=256),
+]
+
 def generate_options():
     def decorator(func):
         # First add required common options (like data_config)
@@ -106,7 +112,7 @@ def generate_options():
                            help="Dataset config class name (e.g., DEAPConfig)")(func)
         
         # Get all dataset config classes
-        dataset_configs = [DEAPConfig, MAHNOBConfig, AMIGOSConfig, DREAMERConfig, SeedIVConfig, SeedConfig]
+        dataset_configs = [DEAPConfig, MAHNOBConfig, AMIGOSConfig, DREAMERConfig, SeedIVConfig, SeedConfig, EmognitionConfig]
         
         # Get all other config classes
         other_configs = [TransformConfig, TrainingConfig, EEGNetConfig, TSceptionConfig, DeepConvNetConfig, ShallowConvNetConfig]
