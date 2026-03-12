@@ -161,11 +161,43 @@ def generate_options():
 @click.option("--log_predictions_dir", type=str, help="directory to save logged predictions")
 @click.option("--train_val_split", type=float, default=0.8, help="ratio of training data to use for training (rest for validation)")
 @click.option("--random_seed", type=int, default=2025, help="random seed for reproducibility")
+# ---------- split / experiment flags ----------
+@click.option("--split_type", default=None, type=click.Choice(["LOSO", "LOSO_Fixed", "LOTO"]),
+              help="Override split strategy: LOSO, LOSO_Fixed, or LOTO")
+@click.option("--use_baseline_reduction", default=None, type=bool,
+              help="Enable InvBase baseline reduction (Emognition only)")
+@click.option("--train_subjects", default=None, type=str,
+              help="Comma-separated train subject IDs for LOSO_Fixed, e.g. '23,24,25'")
+@click.option("--test_subjects", default=None, type=str,
+              help="Comma-separated test subject IDs for LOSO_Fixed, e.g. '60,61,62'")
 @generate_options()
 
 def main(**kwargs):
     setup_seed(kwargs["random_seed"])
     print(f"[INFO] Using random seed: {kwargs['random_seed']}")
+
+    # -------------- Override split_type if passed explicitly --------------
+    if kwargs.get("split_type") is not None:
+        print(f"[INFO] split_type overridden via CLI: {kwargs['split_type']}")
+    else:
+        # fall back to config default (already set by generate_options wrapper)
+        pass
+
+    # -------------- Override use_baseline_reduction if passed explicitly --
+    if kwargs.get("use_baseline_reduction") is not None:
+        print(f"[INFO] use_baseline_reduction overridden via CLI: {kwargs['use_baseline_reduction']}")
+
+    # -------------- Parse inline train/test subject overrides -------------
+    if kwargs.get("train_subjects"):
+        raw = [s.strip() for s in kwargs["train_subjects"].split(",") if s.strip()]
+        # try numeric conversion so it matches whatever type the dataset expects
+        kwargs["_train_subjects_override"] = raw
+        print(f"[INFO] train_subjects override: {raw}")
+    if kwargs.get("test_subjects"):
+        raw = [s.strip() for s in kwargs["test_subjects"].split(",") if s.strip()]
+        kwargs["_test_subjects_override"] = raw
+        print(f"[INFO] test_subjects override: {raw}")
+
     # -------------- Data --------------
     transform = globals().get(kwargs["data_name"] + "_transform")
     # Update sampling_r in any Resample transform to match CLI parameter

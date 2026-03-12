@@ -221,7 +221,7 @@ def run_loto(
         # Log final test results
         # testID = test_ids[0]
         # if isinstance(testID, str) and '<EOF>' in testID:
-        #     testID = testID.split('<EOF>')[0]
+        #     testID = testID.split('<EOF>'[0])
             
         # Log predictions if enabled
         if kwargs.get("log_predictions", False) is True:
@@ -489,11 +489,17 @@ def main_loso_fixed(dataset, model, empty_model, classes, **kwargs):
     dataset_name = dataset.__class__.__name__
     test_subjects_json_path = 'test_subjects.json'
 
-    with open(test_subjects_json_path, 'r') as file:
-        train_test_split_json = json.load(file)
-
-    train_set = train_test_split_json[dataset_name]['train']
-    test_set = train_test_split_json[dataset_name]['test']
+    # --- CLI inline subject override takes priority over test_subjects.json ---
+    if kwargs.get("_train_subjects_override") and kwargs.get("_test_subjects_override"):
+        train_set = kwargs["_train_subjects_override"]
+        test_set  = kwargs["_test_subjects_override"]
+        print(f"[INFO] Using CLI subject override — train: {train_set}, test: {test_set}")
+    else:
+        with open(test_subjects_json_path, 'r') as file:
+            train_test_split_json = json.load(file)
+        train_set = train_test_split_json[dataset_name]['train']
+        test_set  = train_test_split_json[dataset_name]['test']
+        print(f"[INFO] Using test_subjects.json — train: {len(train_set)} subjects, test: {len(test_set)} subjects")
 
     # Pass train_val_split parameter to the data loader
     train_val_split = kwargs.get("train_val_split", 0.8)

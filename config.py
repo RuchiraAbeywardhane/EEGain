@@ -65,11 +65,11 @@ class SeedConfig:
 class EmognitionConfig:
     data_path: str = ""
     label_type: str = "V"          # unused, kept for API compatibility
-    split_type: str = "LOSO"
-    class_names: list[str] = field(default_factory=lambda: ["boredom", "neutral", "negative", "positive"])
+    split_type: str = "LOSO_Fixed"
+    class_names: list[str] = field(default_factory=lambda: ["enthusiasm", "neutral", "sadness", "fear"])
     ground_truth_threshold: float = 0.0   # unused
     n_classes: int = 4
-    use_baseline_reduction: bool = False
+    use_baseline_reduction: bool = True
     sampling_r: int = 256
 
 @dataclass
