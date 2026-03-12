@@ -13,7 +13,7 @@ import json
 from eegain.data import EEGDataloader
 from eegain.data.datasets import DEAP, MAHNOB, SeedIV
 from eegain.logger import EmotionLogger
-from eegain.models import DeepConvNet, EEGNet, ShallowConvNet, TSception, RandomModel_class_distribution, RandomModel_most_occurring
+from eegain.models import DeepConvNet, EEGNet, ShallowConvNet, TSception, RandomModel_class_distribution, RandomModel_most_occurring, SVMClassifier
 from collections import defaultdict
 from sklearn.metrics import *
 
@@ -345,85 +345,95 @@ def run_loso(
     logger.log_summary(overal_log_file="overal_log", log_dir="logs/")
 
 
-def main_loto(dataset, model, empty_model, classes, **kwargs):
-    subject_video_mapping = dataset.mapping_list
-    logger = EmotionLogger(log_dir=kwargs["log_dir"], class_names=classes)
+def run_svm(
+        model,
+        train_dataloader,
+        test_dataloader,
+        loss_fn,
+        logger,
+        test_subject_ids,
+        test_videos,
+        **kwargs
+):
+    """
+    Single-shot SVM training loop:
+      1. Accumulate all training batches (model.forward in train mode = collect features)
+      2. Fit SVM on collected features + labels
+      3. Evaluate on test set
+    No epochs, no backprop, no scheduler.
+    """
+    from eegain.models import SVMClassifier
 
-    for subject_id, session_ids in subject_video_mapping.items():
-        n_fold=len(session_ids)
-        #n_fold=10 # (for 10-fold cross validation to replicate the TSception paper) 
-        
-        # Pass train_val_split parameter to the data loader
-        train_val_split = kwargs.get("train_val_split", 0.8)
-        eegloader = EEGDataloader(dataset, batch_size=kwargs["batch_size"]).loto(
-            subject_id, session_ids, n_fold=n_fold, train_val_split=train_val_split)
-        
-        if kwargs["model_name"]=="RANDOM_most_occurring" or kwargs["model_name"]=="RANDOM_class_distribution":
-            num_epoch = 1
-        else:
-            num_epoch = kwargs["num_epochs"]
-        #num_epoch = kwargs["num_epochs"]
-        
-        all_train_preds_for_subject = []
-        all_train_actuals_for_subject = []
-        all_test_preds_for_subject = []
-        all_test_actuals_for_subject = []
-        
-        for i, loader in enumerate(eegloader):
-            if kwargs["model_name"] == "RANDOM_most_occurring":
-                model = RandomModel_most_occurring(loader["train"], loader["val"])
-                is_random = True
-                optimizer = None
-                scheduler = None
-            elif kwargs["model_name"] == "RANDOM_class_distribution":
-                model = RandomModel_class_distribution(loader["train"], loader["val"])
-                is_random = True
-                optimizer = None
-                scheduler = None
-            else:
-                model = copy.deepcopy(empty_model)
-                model = model.to(device)
-                optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"], weight_decay=kwargs["weight_decay"])
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=0)
-                is_random = False
-                
-            class_weights = compute_class_weights(loader["train"], len(classes))
-            loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=kwargs["label_smoothing"])
-            
-            # Call the modified run_loto with validation data
-            train_pred, train_actual, test_pred, test_actual = run_loto(
-                model=model,
-                train_dataloader=loader["train"],
-                val_dataloader=loader["val"],  # Pass validation dataloader
-                test_dataloader=loader["test"],
-                test_ids=loader["test_session_indexes"],
-                optimizer=optimizer,
-                scheduler=scheduler,
-                loss_fn=loss_fn,
-                epoch=num_epoch,
-                logger=logger,
-                random_baseline=is_random,
-                subject_id=loader["subject_id"],
-                **kwargs,
-            )
-            
-            # all_train_preds_for_subject.append(train_pred)
-            # all_train_actuals_for_subject.append(train_actual)
-            all_test_preds_for_subject.append(test_pred)
-            all_test_actuals_for_subject.append(test_actual)
+    print("[SVM] Collecting training features...")
+    model.train()
+    model.to(device)
+    all_train_labels = []
 
-        # Flatten lists of predictions and actuals
-        # all_train_preds_for_subject = [item for sublist in all_train_preds_for_subject for item in sublist]
-        # all_train_actuals_for_subject = [item for sublist in all_train_actuals_for_subject for item in sublist]
-        all_test_preds_for_subject = [item for sublist in all_test_preds_for_subject for item in sublist]
-        all_test_actuals_for_subject = [item for sublist in all_test_actuals_for_subject for item in sublist]
+    pbar = tqdm(train_dataloader, desc="SVM collect")
+    for x_batch, y_batch in pbar:
+        x_batch = x_batch.to(device)
+        model(x_batch)                        # accumulates features internally
+        all_train_labels.extend(y_batch.tolist())
 
-        logger.log(subject_id, all_test_preds_for_subject, all_test_actuals_for_subject, num_epoch, "test")
-        
-    logger.log_summary(overal_log_file=kwargs["overal_log_file"], log_dir=kwargs["log_dir"])
+    # Fit on all accumulated features
+    all_train_labels = torch.tensor(all_train_labels)
+    print(f"[SVM] Fitting on {len(all_train_labels)} samples...")
+    model.fit_svm(all_train_labels)
+
+    # Evaluate
+    print("[SVM] Evaluating...")
+    model.eval()
+    all_preds, all_actuals = [], []
+    dataset_size, running_loss = 0, 0.0
+
+    pbar = tqdm(test_dataloader, desc="SVM test")
+    with torch.no_grad():
+        for x_batch, y_batch in pbar:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            out  = model(x_batch)             # returns proba tensor
+            loss = loss_fn(out, y_batch)
+            _, pred = torch.max(out, 1)
+
+            dataset_size  += x_batch.size(0)
+            running_loss  += loss.item() * x_batch.size(0)
+            all_preds.extend(pred.cpu().tolist())
+            all_actuals.extend(y_batch.cpu().tolist())
+            pbar.set_postfix(loss=f"{running_loss/dataset_size:.4f}")
+
+    epoch_loss = running_loss / dataset_size
+
+    # Log single "epoch 1" result
+    logger.log(test_subject_ids[0], all_preds, all_actuals, 1, "test", epoch_loss)
+    logger.log_summary(overal_log_file=kwargs.get("overal_log_file", "logs.txt"),
+                       log_dir=kwargs.get("log_dir", "logs/"))
+
+    return all_preds, all_actuals
 
 
 def loso_loop(model, loader, logger, **kwargs):
+    from eegain.models import SVMClassifier
+
+    # ---- SVM: special single-shot path --------------------------------
+    if isinstance(model, SVMClassifier):
+        model.reset()
+        model.to(device)
+        class_weights = compute_class_weights(loader["train"], kwargs["num_classes"])
+        loss_fn = nn.CrossEntropyLoss(weight=class_weights,
+                                      label_smoothing=kwargs["label_smoothing"])
+        run_svm(
+            model=model,
+            train_dataloader=loader["train"],
+            test_dataloader=loader["test"],
+            loss_fn=loss_fn,
+            logger=logger,
+            test_subject_ids=loader["test_subject_indexes"],
+            test_videos=loader["test_videos"],
+            **kwargs,
+        )
+        return
+
+    # ---- normal deep-learning path ------------------------------------
     if kwargs["model_name"]=="RANDOM_most_occurring":
         model = RandomModel_most_occurring(loader["train"], loader["val"])
         optimizer = None

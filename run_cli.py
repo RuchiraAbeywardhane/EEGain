@@ -12,7 +12,7 @@ import eegain
 from eegain.data import EEGDataloader
 from eegain.data.datasets import DEAP, MAHNOB, SeedIV, AMIGOS, DREAMER, Seed, Emognition
 from eegain.logger import EmotionLogger
-from eegain.models import DeepConvNet, EEGNet, ShallowConvNet, TSception, MultiScaleEEGNet
+from eegain.models import DeepConvNet, EEGNet, ShallowConvNet, TSception, MultiScaleEEGNet, SVMClassifier
 from collections import defaultdict
 from dataclasses import asdict
 
@@ -173,6 +173,13 @@ def generate_options():
 @click.option("--window_scales", default=None, type=str,
               help="Comma-separated window durations in seconds for MultiScaleEEGNet, e.g. '2,4,8'. "
                    "--window must equal the largest value.")
+# ---------- SVM flags ----------
+@click.option("--svm_kernel", default="rbf", type=click.Choice(["rbf", "linear", "poly", "sigmoid"]),
+              help="SVM kernel type (default: rbf)")
+@click.option("--svm_c", default=1.0, type=float,
+              help="SVM regularisation parameter C (default: 1.0)")
+@click.option("--svm_features", default="bandpower", type=click.Choice(["bandpower", "flatten", "eegnet"]),
+              help="Feature extraction for SVM: bandpower | flatten | eegnet (default: bandpower)")
 @generate_options()
 
 def main(**kwargs):
@@ -251,8 +258,23 @@ def main(**kwargs):
         empty_model = None
     # -------------- Model --------------
     else:
-        model = globals()[kwargs['model_name']](input_size=[1, kwargs["channels"], kwargs["window"]*kwargs["sampling_r"]], **kwargs)
-        empty_model = copy.deepcopy(model)
+        if kwargs["model_name"] == "SVMClassifier":
+            model = SVMClassifier(
+                num_classes=kwargs["num_classes"],
+                channels=kwargs["channels"],
+                dropout_rate=kwargs.get("dropout_rate", 0.5),
+                sampling_r=kwargs["sampling_r"],
+                svm_kernel=kwargs["svm_kernel"],
+                svm_c=kwargs["svm_c"],
+                svm_features=kwargs["svm_features"],
+                **{k: v for k, v in kwargs.items()
+                   if k not in ["num_classes","channels","dropout_rate",
+                                "sampling_r","svm_kernel","svm_c","svm_features"]},
+            )
+            empty_model = copy.deepcopy(model)
+        else:
+            model = globals()[kwargs['model_name']](input_size=[1, kwargs["channels"], kwargs["window"]*kwargs["sampling_r"]], **kwargs)
+            empty_model = copy.deepcopy(model)
         
     if kwargs["split_type"] == "LOSO":
         classes = [i for i in range(kwargs["num_classes"])]
