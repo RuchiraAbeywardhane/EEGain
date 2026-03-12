@@ -95,8 +95,8 @@ class EEGNetConfig:
 class TSceptionConfig:
     num_classes: int = 2
     sampling_r: int = 128
-    num_t: int = 15
-    num_s: int = 15
+    num_t: int = 9       # reduced from 15 — fewer temporal filters for 4-channel data
+    num_s: int = 6       # reduced from 15 — only 4 spatial sources, 6 filters is enough
     hidden: int = 32
     dropout_rate: float = 0.5
 

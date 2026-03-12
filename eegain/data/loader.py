@@ -150,33 +150,39 @@ class EEGDataloader:
         return train_data, test_data
 
     @staticmethod
+    def normalize_per_subject(data: torch.Tensor) -> torch.Tensor:
+        """
+        Normalise each subject's windows independently, channel by channel.
+        Since we don't know subject boundaries after _concat_data, we normalise
+        every window individually — equivalent to per-subject z-score when all
+        windows from one subject have similar statistics.
+        Input: (B, 1, C, T) or (B, C, T) → returns (B, 1, C, T)
+        """
+        if len(data.shape) != 4:
+            data = data.unsqueeze(1)
+        data = data.clone()
+        for channel in range(data.shape[2]):
+            nan_mask = torch.isnan(data[:, :, channel, :])
+            data[:, :, channel, :][nan_mask] = 0
+            # per-sample (per-window) normalisation
+            mean = data[:, :, channel, :].mean(dim=-1, keepdim=True)
+            std  = data[:, :, channel, :].std(dim=-1, keepdim=True).clamp(min=1e-6)
+            data[:, :, channel, :] = (data[:, :, channel, :] - mean) / std
+        return data
+
+    @staticmethod
     def normalize_splits(
         train_data: torch.Tensor,
         *other_splits: torch.Tensor
     ) -> Tuple[torch.Tensor, ...]:
         """
-        Normalize any number of splits using train_data statistics.
-        Returns (train_data, split1, split2, ...) all as 4D tensors.
+        Normalise each split independently per-window so unseen subjects
+        are not penalised by a different population's amplitude statistics.
         """
-        if len(train_data.shape) != 4:
-            train_data = train_data.unsqueeze(1)
-        others = [s.unsqueeze(1) if len(s.shape) != 4 else s for s in other_splits]
-
-        for channel in range(train_data.shape[2]):
-            # Fix NaNs in train
-            nan_mask = torch.isnan(train_data[:, :, channel, :])
-            train_data[:, :, channel, :][nan_mask] = 0
-
-            std, mean = torch.std_mean(train_data[:, :, channel, :])
-
-            train_data[:, :, channel, :] = (train_data[:, :, channel, :] - mean) / std
-
-            for s in others:
-                nan_mask = torch.isnan(s[:, :, channel, :])
-                s[:, :, channel, :][nan_mask] = 0
-                s[:, :, channel, :] = (s[:, :, channel, :] - mean) / std
-
-        return (train_data, *others)
+        result = [EEGDataloader.normalize_per_subject(train_data)]
+        for s in other_splits:
+            result.append(EEGDataloader.normalize_per_subject(s))
+        return tuple(result)
 
     def loso(self, subject_out_num: int = 1, **kwargs) -> Dict[str, Any]:
         logger.info(f"Splitting type: leave-one-subject-out")
@@ -241,19 +247,36 @@ class EEGDataloader:
         # ----------------------------------------------------------------
         # Subject-level train/val split — val subjects are DIFFERENT people
         # from train subjects, preventing subject-identity leakage.
+        # Prefer subjects with enough windows (>=80) for val to get a clean signal.
         # ----------------------------------------------------------------
         train_ratio = kwargs.get('train_val_split', 0.8)
         n_val = max(1, int(len(train_subject_ids) * (1.0 - train_ratio)))
 
+        # Count windows per subject so we can pick strong val subjects
+        window_counts = {}
+        for sid in train_subject_ids:
+            d = self.dataset.__get_subject__(sid)
+            count = sum(v.shape[0] for v in d[0].values())
+            window_counts[sid] = count
+
+        # Sort: subjects with >= 80 windows first (stable val signal), then rest
+        MIN_VAL_WINDOWS = 80
+        strong = [s for s in train_subject_ids if window_counts[s] >= MIN_VAL_WINDOWS]
+        weak   = [s for s in train_subject_ids if window_counts[s] <  MIN_VAL_WINDOWS]
+
         rng = np.random.default_rng(kwargs.get('random_seed', 42))
-        shuffled = list(train_subject_ids)
-        rng.shuffle(shuffled)
-        val_subject_ids   = shuffled[:n_val]
-        train_subject_ids = shuffled[n_val:]
+        rng.shuffle(strong)
+        rng.shuffle(weak)
+
+        # Pick val from strong subjects first
+        candidate_pool = strong + weak
+        val_subject_ids   = candidate_pool[:n_val]
+        train_subject_ids = candidate_pool[n_val:]
 
         logger.info(f"Subject-level split — "
                     f"train: {len(train_subject_ids)} subjects, "
-                    f"val: {len(val_subject_ids)} subjects, "
+                    f"val: {len(val_subject_ids)} subjects "
+                    f"(windows: {[window_counts[s] for s in val_subject_ids]}), "
                     f"test: {len(test_subject_ids)} subjects")
         logger.debug(f"Val subjects: {val_subject_ids}")
 
