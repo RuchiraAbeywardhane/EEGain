@@ -141,3 +141,125 @@ class EEGNet(nn.Module):
             
         x = self.classifierBlock(x)
         return x
+
+
+@register_model
+class MultiScaleEEGNet(nn.Module):
+    """
+    Multi-scale EEGNet: runs N parallel EEGNet branches, each processing
+    a different temporal window length cropped from the same input.
+    Branch outputs are concatenated and fed to a shared classifier.
+
+    The input to forward() is always the LONGEST window (max of scales).
+    Shorter windows are obtained by centre-cropping along the time axis.
+
+    Args:
+        num_classes  : number of output classes
+        channels     : number of EEG channels
+        dropout_rate : dropout probability
+        sampling_r   : sampling rate in Hz
+        window_scales: list of window durations in seconds, e.g. [2, 4, 8]
+                       The largest value must equal the --window CLI arg.
+        f1, d, f2    : EEGNet filter counts (same for all branches)
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        channels,
+        dropout_rate,
+        sampling_r=256,
+        window_scales=None,
+        f1=8,
+        d=2,
+        f2=16,
+        **kwargs,
+    ):
+        super().__init__()
+
+        if window_scales is None:
+            # default: 2s / 4s / 8s  (largest = --window CLI value)
+            window_scales = [2, 4, 8]
+
+        self.window_scales = sorted(window_scales)   # ascending
+        self.max_samples   = int(max(window_scales) * sampling_r)
+        self.sampling_r    = sampling_r
+        self.n_classes     = num_classes
+
+        scaling_factor = sampling_r / 128
+
+        # ---- build one EEGNet feature-extractor per scale ---------------
+        self.branches = nn.ModuleList()
+        for w in self.window_scales:
+            samples = int(w * sampling_r)
+            klen1   = int(64 * scaling_factor)
+            klen2   = int(16 * scaling_factor)
+            ps1     = int(4  * scaling_factor)
+            ps2     = int(8  * scaling_factor)
+
+            block1 = nn.Sequential(
+                nn.Conv2d(1, f1, (1, klen1),
+                          stride=1, padding=(0, klen1 // 2), bias=False),
+                nn.BatchNorm2d(f1, momentum=0.01, affine=True, eps=1e-3),
+                Conv2dWithConstraint(f1, f1 * d, (channels, 1),
+                                     max_norm=1, stride=1, padding=(0, 0),
+                                     groups=f1, bias=False),
+                nn.BatchNorm2d(f1 * d, momentum=0.01, affine=True, eps=1e-3),
+                nn.ELU(),
+                nn.AvgPool2d((1, ps1), stride=ps1),
+                nn.Dropout(p=dropout_rate),
+            )
+            block2 = nn.Sequential(
+                nn.Conv2d(f1 * d, f1 * d, (1, klen2),
+                          stride=1, padding=(0, klen2 // 2),
+                          bias=False, groups=f1 * d),
+                nn.Conv2d(f1 * d, f2, 1,
+                          padding=(0, 0), groups=1, bias=False, stride=1),
+                nn.BatchNorm2d(f2, momentum=0.01, affine=True, eps=1e-3),
+                nn.ELU(),
+                nn.AvgPool2d((1, ps2), stride=ps2),
+                nn.Dropout(p=dropout_rate),
+            )
+            self.branches.append(nn.Sequential(block1, block2))
+
+        # classifier built lazily on first forward pass
+        self.classifier = None
+        self._f2          = f2
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _centre_crop(x: torch.Tensor, target_samples: int) -> torch.Tensor:
+        """Centre-crop x (batch, 1, C, T) to (batch, 1, C, target_samples)."""
+        T = x.shape[-1]
+        if T == target_samples:
+            return x
+        if T < target_samples:
+            # zero-pad symmetrically if input is shorter (edge case)
+            pad = target_samples - T
+            return torch.nn.functional.pad(x, (pad // 2, pad - pad // 2))
+        start = (T - target_samples) // 2
+        return x[..., start : start + target_samples]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (batch, 1, channels, T_max)
+        branch_features = []
+        for branch, w in zip(self.branches, self.window_scales):
+            target = int(w * self.sampling_r)
+            x_crop = self._centre_crop(x, target)   # (B, 1, C, target)
+            feat   = branch(x_crop)                  # (B, F2, 1, T')
+            feat   = feat.flatten(1)                 # (B, feat_dim)
+            branch_features.append(feat)
+
+        combined = torch.cat(branch_features, dim=1)  # (B, sum of feat_dims)
+
+        # build classifier once we know the combined feature size
+        if self.classifier is None:
+            in_size = combined.shape[1]
+            self.classifier = nn.Sequential(
+                nn.Linear(in_size, self.n_classes, bias=False),
+                nn.Softmax(dim=1),
+            ).to(combined.device)
+            print(f"[MultiScaleEEGNet] classifier input_size={in_size} "
+                  f"scales={self.window_scales}s")
+
+        return self.classifier(combined)

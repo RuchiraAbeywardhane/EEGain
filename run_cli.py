@@ -12,7 +12,7 @@ import eegain
 from eegain.data import EEGDataloader
 from eegain.data.datasets import DEAP, MAHNOB, SeedIV, AMIGOS, DREAMER, Seed, Emognition
 from eegain.logger import EmotionLogger
-from eegain.models import DeepConvNet, EEGNet, ShallowConvNet, TSception
+from eegain.models import DeepConvNet, EEGNet, ShallowConvNet, TSception, MultiScaleEEGNet
 from collections import defaultdict
 from dataclasses import asdict
 
@@ -170,6 +170,9 @@ def generate_options():
               help="Comma-separated train subject IDs for LOSO_Fixed, e.g. '23,24,25'")
 @click.option("--test_subjects", default=None, type=str,
               help="Comma-separated test subject IDs for LOSO_Fixed, e.g. '60,61,62'")
+@click.option("--window_scales", default=None, type=str,
+              help="Comma-separated window durations in seconds for MultiScaleEEGNet, e.g. '2,4,8'. "
+                   "--window must equal the largest value.")
 @generate_options()
 
 def main(**kwargs):
@@ -197,6 +200,20 @@ def main(**kwargs):
         raw = [s.strip() for s in kwargs["test_subjects"].split(",") if s.strip()]
         kwargs["_test_subjects_override"] = raw
         print(f"[INFO] test_subjects override: {raw}")
+
+    # -------------- Parse window_scales for MultiScaleEEGNet --------------
+    if kwargs.get("window_scales"):
+        scales = [int(s.strip()) for s in kwargs["window_scales"].split(",") if s.strip()]
+        kwargs["window_scales"] = scales
+        # --window must be the largest scale so the Segment transform produces
+        # windows large enough for every branch
+        if kwargs["window"] != max(scales):
+            print(f"[WARNING] --window ({kwargs['window']}) != max(window_scales) "
+                  f"({max(scales)}). Setting --window to {max(scales)}.")
+            kwargs["window"] = max(scales)
+        print(f"[INFO] MultiScaleEEGNet window_scales: {scales}s")
+    else:
+        kwargs["window_scales"] = None
 
     # -------------- Data --------------
     transform = globals().get(kwargs["data_name"] + "_transform")
