@@ -3,20 +3,17 @@ Entry point for the PCRNN pipeline.
 
 Usage examples
 --------------
-# Run 10-fold CV on subject 1 (Valence):
-    python -m pcr_pipeline.run --data_path /path/to/deap --subject 1
+# DEAP – Valence, subject 1:
+    python -m pcr_pipeline.run --dataset deap --data_path /path/to/deap --subject 1
 
-# Run on all subjects and save a log:
-    python -m pcr_pipeline.run --data_path /path/to/deap --all_subjects --label_type V
+# DEAP – Arousal, all subjects:
+    python -m pcr_pipeline.run --dataset deap --data_path /path/to/deap --all_subjects --label_type A
 
-# Run Arousal on subject 5, custom epochs:
-    python -m pcr_pipeline.run --data_path /path/to/deap --subject 5 --label_type A --num_epochs 30
+# Emognition – subject P01:
+    python -m pcr_pipeline.run --dataset emognition --data_path /path/to/emognition --subject P01
 
-Modes
------
---subject N      : 10-fold CV on a single subject's 2400 windows
---all_subjects   : concatenate all subjects then run 10-fold CV
-                   (cross-subject experiment)
+# Emognition – all subjects, custom lead-in:
+    python -m pcr_pipeline.run --dataset emognition --data_path /path/to/emognition --all_subjects --lead_in 3.0
 """
 
 import argparse
@@ -26,15 +23,11 @@ import sys
 import numpy as np
 import torch
 
-# Allow running as  python -m pcr_pipeline.run  from the repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pcr_pipeline.config  import PCRConfig
 from pcr_pipeline.dataset import load_subject_trials, get_subject_ids
 from pcr_pipeline.train   import run_10fold_cv, save_results
-
-
-# ── Logging setup ────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,47 +37,65 @@ logging.basicConfig(
 logger = logging.getLogger("PCR.Run")
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="PCRNN – Parallel CNN-LSTM for DEAP EEG emotion recognition"
+        description="PCRNN – Parallel CNN-LSTM for EEG emotion recognition"
     )
 
-    # Dataset
-    p.add_argument("--data_path",   required=True,  help="Path to folder containing DEAP .dat files")
-    p.add_argument("--label_type",  default="V",    choices=["V", "A"], help="V=Valence, A=Arousal")
-    p.add_argument("--threshold",   default=4.5,    type=float, help="Binary label threshold (inclusive low)")
+    # ── Dataset ───────────────────────────────────────────────────────────────
+    p.add_argument("--dataset",     default="deap",
+                   choices=["deap", "emognition"],
+                   help="Which dataset to use")
+    p.add_argument("--data_path",   required=True,
+                   help="Path to dataset folder")
 
-    # Subject selection
+    # ── DEAP-specific ─────────────────────────────────────────────────────────
+    p.add_argument("--label_type",  default="V", choices=["V", "A"],
+                   help="(DEAP) V=Valence  A=Arousal")
+    p.add_argument("--threshold",   default=4.5, type=float,
+                   help="(DEAP) Binary label threshold")
+
+    # ── Emognition-specific ───────────────────────────────────────────────────
+    p.add_argument("--lead_in",     default=5.0, type=float,
+                   help="(Emognition) Seconds to discard from clip start "
+                        "(emotionally neutral lead-in).  Default=5.0")
+    p.add_argument("--baseline_dur",default=3.0, type=float,
+                   help="(Emognition) Seconds after lead-in used as baseline. "
+                        "Default=3.0")
+
+    # ── Subject selection ─────────────────────────────────────────────────────
     grp = p.add_mutually_exclusive_group(required=True)
-    grp.add_argument("--subject",      type=int,  help="Run 10-fold CV on a single subject (1-indexed)")
-    grp.add_argument("--all_subjects", action="store_true", help="Concatenate all subjects then run CV")
+    grp.add_argument("--subject",
+                     help="Single subject  (int for DEAP, string for Emognition)")
+    grp.add_argument("--all_subjects", action="store_true",
+                     help="Run CV over all subjects found in data_path")
 
-    # Training hyper-parameters
+    # ── Training ──────────────────────────────────────────────────────────────
     p.add_argument("--n_folds",     default=10,   type=int)
     p.add_argument("--batch_size",  default=64,   type=int)
     p.add_argument("--lr",          default=1e-4, type=float)
     p.add_argument("--num_epochs",  default=50,   type=int)
-    p.add_argument("--patience",    default=7,    type=int,  help="Early-stopping patience (epochs)")
+    p.add_argument("--patience",    default=7,    type=int)
     p.add_argument("--seed",        default=42,   type=int)
-
-    # Output
-    p.add_argument("--log_dir",     default="pcr_logs/", help="Directory to save result logs")
+    p.add_argument("--log_dir",     default="pcr_logs/")
 
     return p.parse_args()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def _make_config(args) -> PCRConfig:
+    """Build a PCRConfig from parsed CLI args, setting dataset-specific fields."""
+    is_emog = args.dataset.lower() == "emognition"
 
-def main():
-    args = parse_args()
-
-    # Build config from CLI args
     cfg = PCRConfig(
+        dataset                 = args.dataset.lower(),
         data_path               = args.data_path,
+        # DEAP fields
         label_type              = args.label_type,
         ground_truth_threshold  = args.threshold,
+        # Emognition fields
+        lead_in_duration        = args.lead_in,
+        baseline_duration       = args.baseline_dur,
+        # Training
         n_folds                 = args.n_folds,
         batch_size              = args.batch_size,
         lr                      = args.lr,
@@ -94,29 +105,74 @@ def main():
         log_dir                 = args.log_dir,
     )
 
+    # ── Auto-configure dataset-specific parameters ────────────────────────────
+    if is_emog:
+        cfg.sampling_rate  = 256
+        cfg.n_eeg_channels = 4
+        cfg.n_classes      = len(cfg.emognition_class_map)
+        cfg.class_names    = list(cfg.emognition_class_map.keys())
+        cfg.window_size    = 128   # will be scaled ×2 inside loader/model (→256 samples)
+        cfg.window_step    = 128
+    else:
+        cfg.sampling_rate  = 128
+        cfg.n_eeg_channels = 32
+        cfg.n_classes      = 2
+        cfg.class_names    = ["low", "high"]
+
+    return cfg
+
+
+def main():
+    args = parse_args()
+    cfg  = _make_config(args)
+
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    logger.info(f"Device : {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
-    logger.info(f"Label  : {cfg.label_type}  |  Threshold : {cfg.ground_truth_threshold}")
-    logger.info(f"Config : {cfg}")
+    logger.info(f"Dataset : {cfg.dataset.upper()}")
+    logger.info(f"Device  : {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
 
-    # ── Load data  (trial-level, no leakage) ─────────────────────────────────
+    if cfg.dataset == "deap":
+        logger.info(f"Label   : {cfg.label_type}  |  Threshold : {cfg.ground_truth_threshold}")
+    else:
+        logger.info(
+            f"Classes : {cfg.class_names}  |  "
+            f"Lead-in : {cfg.lead_in_duration}s  |  "
+            f"Baseline: {cfg.baseline_duration}s"
+        )
+
+    # ── Load data (trial-level, no leakage) ───────────────────────────────────
+    is_emog = cfg.dataset == "emognition"
+
     if args.subject:
-        logger.info(f"Loading subject {args.subject:02d} …")
-        trials_2d, trials_1d, trial_labels = load_subject_trials(args.subject, cfg)
-        log_name = f"subject_{args.subject:02d}_{cfg.label_type}"
+        # Convert to int for DEAP, keep as string for Emognition
+        subject_id = args.subject if is_emog else int(args.subject)
+        logger.info(f"Loading subject {subject_id} …")
+        trials_2d, trials_1d, trial_labels = load_subject_trials(subject_id, cfg)
+        log_name = (
+            f"emognition_subject_{subject_id}"
+            if is_emog
+            else f"deap_subject_{int(subject_id):02d}_{cfg.label_type}"
+        )
     else:
         subject_ids = get_subject_ids(cfg)
         logger.info(f"Found {len(subject_ids)} subjects: {subject_ids}")
         trials_2d, trials_1d, trial_labels = [], [], []
         for sid in subject_ids:
-            logger.info(f"  Loading subject {sid:02d} …")
+            logger.info(f"  Loading subject {sid} …")
             t2, t1, tl = load_subject_trials(sid, cfg)
             trials_2d.extend(t2)
             trials_1d.extend(t1)
             trial_labels.extend(tl)
-        log_name = f"all_subjects_{cfg.label_type}"
+        log_name = (
+            "emognition_all_subjects"
+            if is_emog
+            else f"deap_all_subjects_{cfg.label_type}"
+        )
+
+    if not trials_2d:
+        logger.error("No trials loaded — check your data path and subject ID.")
+        return
 
     total_windows = sum(t.shape[0] for t in trials_2d)
     logger.info(
@@ -124,7 +180,7 @@ def main():
         f"class dist (trials): {[trial_labels.count(c) for c in range(cfg.n_classes)]}"
     )
 
-    # ── Run 10-fold CV  (split at trial level) ────────────────────────────────
+    # ── Run 10-fold CV (split at trial level) ─────────────────────────────────
     summary = run_10fold_cv(trials_2d, trials_1d, trial_labels, cfg)
 
     # ── Save results ──────────────────────────────────────────────────────────

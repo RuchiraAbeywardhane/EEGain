@@ -11,6 +11,13 @@ Steps (in order):
 DEAP electrode layout (32 channels → 9×9 grid, 10-20 system):
     Row/col indices are 0-based.
     Positions without electrodes remain 0.
+
+Emognition path  (4 channels, 256 Hz):
+    lead_in_trim → baseline_removal → zscore_normalize_1d → sliding_window_1d
+
+The sliding_window functions always produce two parallel arrays:
+    windows_2d : [N, W, H, W_grid]   – CNN spatial input  (DEAP only; dummy for Emognition)
+    windows_1d : [N, W, C]           – LSTM temporal input (both datasets)
 """
 
 import numpy as np
@@ -42,6 +49,35 @@ DEAP_CHANNELS = [
     "Fp2", "AF4", "Fz", "F4", "F8",  "FC6", "FC2", "Cz",
     "C4",  "T8",  "CP6", "CP2", "P4", "P8",  "PO4", "O2",
 ]
+
+
+# ── Shared Utilities ────────────────────────────────────────────────────────
+
+def lead_in_trim(signal: np.ndarray, lead_in_samples: int) -> np.ndarray:
+    """
+    Discard the first `lead_in_samples` samples from a signal.
+
+    Used for Emognition clips where the first few seconds contain no
+    emotional content (video fade-in / neutral lead-in period).
+    The number of samples is derived from:
+        lead_in_samples = int(lead_in_duration * sampling_rate)
+    so you can change `lead_in_duration` in PCRConfig to adjust the trim.
+
+    Args:
+        signal        : np.ndarray  shape [C, T]  – raw EEG signal
+        lead_in_samples : int – number of samples to discard from the front
+
+    Returns:
+        np.ndarray  shape [C, T - lead_in_samples]
+    """
+    if lead_in_samples <= 0:
+        return signal
+    if lead_in_samples >= signal.shape[1]:
+        raise ValueError(
+            f"lead_in_samples ({lead_in_samples}) >= signal length "
+            f"({signal.shape[1]}).  Reduce lead_in_duration in PCRConfig."
+        )
+    return signal[:, lead_in_samples:]
 
 
 # ── 1. Baseline Removal ──────────────────────────────────────────────────────
@@ -176,6 +212,25 @@ def zscore_normalize_frames(frames: np.ndarray) -> np.ndarray:
     return normalized
 
 
+def zscore_normalize_1d(eeg: np.ndarray) -> np.ndarray:
+    """
+    Per-channel Z-score normalisation over the full signal.
+
+    Args:
+        eeg : np.ndarray  shape [C, T]
+
+    Returns:
+        np.ndarray  shape [C, T]  (float32)
+    """
+    eeg = eeg.astype(np.float32, copy=True)
+    for c in range(eeg.shape[0]):
+        mu  = eeg[c].mean()
+        sig = eeg[c].std()
+        sig = sig if sig > 1e-8 else 1e-8
+        eeg[c] = (eeg[c] - mu) / sig
+    return eeg
+
+
 # ── 4. Sliding Window Segmentation ────────────────────────────────────────────
 
 def sliding_window(
@@ -204,6 +259,32 @@ def sliding_window(
     windows_2d = np.stack([frames_2d[s:s + window_size] for s in starts])   # [N, W, H, W_grid]
     windows_1d = np.stack([eeg_1d[:, s:s + window_size].T for s in starts]) # [N, W, C]
 
+    return windows_2d.astype(np.float32), windows_1d.astype(np.float32)
+
+
+def sliding_window_1d(
+    eeg: np.ndarray,
+    window_size: int = 256,
+    step: int = 256,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Segment a 1-D EEG signal into windows.
+    Returns a dummy all-zero windows_2d (shape [N, window_size, 1, 1])
+    so the rest of the pipeline (dataset, train) stays shape-consistent.
+
+    Args:
+        eeg         : np.ndarray  shape [C, T]
+        window_size : int
+        step        : int
+
+    Returns:
+        windows_2d : [N, window_size, 1, 1]  – dummy zeros (ignored by 1D model)
+        windows_1d : [N, window_size, C]
+    """
+    C, T   = eeg.shape
+    starts = range(0, T - window_size + 1, step)
+    windows_1d = np.stack([eeg[:, s:s + window_size].T for s in starts])  # [N, W, C]
+    windows_2d = np.zeros((len(windows_1d), window_size, 1, 1), dtype=np.float32)
     return windows_2d.astype(np.float32), windows_1d.astype(np.float32)
 
 
@@ -245,3 +326,61 @@ def preprocess_trial(
     windows_2d, windows_1d = sliding_window(frames, eeg_clean, window_size, step)
 
     return windows_2d, windows_1d
+
+
+def preprocess_trial_emognition(
+    trial_eeg: np.ndarray,
+    sampling_rate: int = 256,
+    lead_in_duration: float = 5.0,
+    baseline_duration: float = 3.0,
+    window_size: int = 256,
+    step: int = 256,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Full Emognition preprocessing for one trial.
+
+    Steps:
+        1. Discard lead-in  (first `lead_in_duration` seconds  — emotionally neutral)
+        2. Extract baseline (next  `baseline_duration` seconds  — used for removal)
+        3. Baseline removal on the remainder
+        4. Per-channel Z-score normalisation
+        5. Sliding window segmentation
+
+    Args:
+        trial_eeg        : np.ndarray  shape [C, T]  – raw EEG (C=4 for MUSE)
+        sampling_rate    : int   – Hz (256 for Emognition)
+        lead_in_duration : float – seconds to discard from the start
+                                   (change via PCRConfig.lead_in_duration)
+        baseline_duration: float – seconds after lead-in used as baseline
+                                   (change via PCRConfig.baseline_duration)
+        window_size      : int   – samples per window
+        step             : int   – stride between windows
+
+    Returns:
+        windows_2d : [N, window_size, 1, 1]  – dummy (not used by 1D model)
+        windows_1d : [N, window_size, C]
+    """
+    lead_in_samples  = int(lead_in_duration  * sampling_rate)
+    baseline_samples = int(baseline_duration * sampling_rate)
+    segment_len      = sampling_rate          # 1-second segments for averaging
+
+    # Step 1 – discard emotionally-neutral lead-in
+    trimmed = lead_in_trim(trial_eeg, lead_in_samples)  # [C, T - lead_in]
+
+    # Step 2 – extract the next `baseline_duration` seconds as the baseline
+    if trimmed.shape[1] <= baseline_samples:
+        raise ValueError(
+            f"Trial too short after lead-in trim: {trimmed.shape[1]} samples "
+            f"remaining, need > {baseline_samples} for baseline."
+        )
+    baseline_eeg = trimmed[:, :baseline_samples]         # [C, baseline_samples]
+    stimulus_eeg = trimmed[:, baseline_samples:]         # [C, T_stimulus]
+
+    # Step 3 – baseline removal
+    eeg_clean = baseline_removal(stimulus_eeg, baseline_eeg, segment_len)
+
+    # Step 4 – per-channel Z-score
+    eeg_clean = zscore_normalize_1d(eeg_clean)
+
+    # Step 5 – sliding window
+    return sliding_window_1d(eeg_clean, window_size, step)
