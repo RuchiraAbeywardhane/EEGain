@@ -109,8 +109,8 @@ def _make_config(args) -> PCRConfig:
     if is_emog:
         cfg.sampling_rate  = 256
         cfg.n_eeg_channels = 4
-        cfg.n_classes      = len(cfg.emognition_class_map)
-        cfg.class_names    = list(cfg.emognition_class_map.keys())
+        cfg.n_classes      = 4
+        cfg.class_names    = ["enthusiasm", "neutral", "fear", "sadness"]
         cfg.window_size    = 128   # will be scaled ×2 inside loader/model (→256 samples)
         cfg.window_step    = 128
     else:

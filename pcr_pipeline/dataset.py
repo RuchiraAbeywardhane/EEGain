@@ -206,14 +206,50 @@ def _emog_interp_nan(a: np.ndarray) -> np.ndarray:
     return a
 
 
+def _emog_is_stimulus_muse(fname: str) -> bool:
+    """
+    Return True only for STIMULUS + MUSE files.
+
+    Real filename pattern:  {SUBJECT}_{EMOTION}_{TYPE}_{DEVICE}.json
+        e.g.  22_AMUSEMENT_STIMULUS_MUSE.json        ← WANT
+              22_AMUSEMENT_STIMULUS_EMPATICA.json     ← skip
+              22_AMUSEMENT_STIMULUS_SAMSUNG_WATCH.json← skip (5 parts)
+              22_AMUSEMENT_QUESTIONNAIRES_MUSE.json   ← skip
+              22_AMUSEMENT_WASHOUT_MUSE.json          ← skip
+    """
+    stem = fname.replace(".json", "")
+    parts = stem.split("_")
+    # Need at least 4 parts: ID, EMOTION, TYPE, DEVICE
+    if len(parts) < 4:
+        return False
+    record_type = parts[2].upper()   # STIMULUS / QUESTIONNAIRES / WASHOUT
+    device      = parts[3].upper()   # MUSE / EMPATICA / SAMSUNG
+    return record_type == "STIMULUS" and device == "MUSE"
+
+
+def _emog_parse_emotion(fname: str) -> str:
+    """Extract the emotion string from a valid Emognition filename."""
+    return fname.split("_")[1].upper()
+
+
+def _emog_parse_subject(fname: str) -> str:
+    """Extract the subject ID string from a valid Emognition filename."""
+    return fname.split("_")[0]
+
+
 def _emog_read_json(fpath: str) -> np.ndarray:
     """
-    Load one Emognition JSON file and return a quality-filtered
-    raw EEG array of shape [4, T] (channels: TP9, AF7, AF8, TP10).
-    Returns None if the signal is empty or all samples are bad quality.
+    Load one Emognition STIMULUS_MUSE JSON file and return a quality-filtered
+    raw EEG array of shape [4, T]  (channels: TP9, AF7, AF8, TP10).
+    Returns None if the signal is empty or all samples fail quality checks.
 
-    Quality filter: keeps only samples where HeadBandOn==1 AND all
-    four HSI scores are <= 2  (1=good contact, 2=ok, 3/4=poor).
+    JSON keys used:
+        RAW_TP9, RAW_AF7, RAW_AF8, RAW_TP10  – raw EEG (µV)
+        HSI_TP9, HSI_AF7, HSI_AF8, HSI_TP10  – signal quality (1=good, 2=ok, 3/4=poor)
+        HeadBandOn                             – 1 if headband is worn
+
+    Quality filter: keep samples where HeadBandOn==1 AND all HSI <= 2.
+    Signal is mean-centred per channel before returning.
     """
     with open(fpath, "r") as f:
         data = json.load(f)
@@ -227,7 +263,6 @@ def _emog_read_json(fpath: str) -> np.ndarray:
     if L == 0:
         return None
 
-    # ── Quality mask ──────────────────────────────────────────────────────
     hsi_tp9  = _emog_to_num(data.get("HSI_TP9",  []))[:L]
     hsi_af7  = _emog_to_num(data.get("HSI_AF7",  []))[:L]
     hsi_af8  = _emog_to_num(data.get("HSI_AF8",  []))[:L]
@@ -247,69 +282,83 @@ def _emog_read_json(fpath: str) -> np.ndarray:
             np.isfinite(hsi_tp10) & (hsi_tp10 <= 2)
         )
 
-    tp9, af7, af8, tp10 = (
-        tp9[:L][mask], af7[:L][mask],
-        af8[:L][mask], tp10[:L][mask],
-    )
+    tp9  = tp9[:L][mask];  af7  = af7[:L][mask]
+    af8  = af8[:L][mask];  tp10 = tp10[:L][mask]
+
     if len(tp9) == 0:
         return None
 
-    signal = np.stack([tp9, af7, af8, tp10], axis=0).astype(np.float32)  # [4, T]
-    # mean-centre each channel
-    signal -= signal.mean(axis=1, keepdims=True)
+    # Stack as [T, 4] (matches real Emognition class), then transpose → [4, T]
+    signal = np.stack([tp9, af7, af8, tp10], axis=1).T.astype(np.float32)  # [4, T]
+    signal -= signal.mean(axis=1, keepdims=True)  # mean-centre per channel
     return signal
 
 
 def get_emognition_subject_ids(cfg: PCRConfig) -> List[str]:
     """
-    Scan the data directory and return a sorted list of unique subject IDs.
-    Subject ID is the first part of the filename before the first underscore,
-    e.g. "P01" from "P01_ENTHUSIASM_STIMULUS_MUSE.json".
+    Scan the data directory and return sorted subject IDs.
+
+    Real layout:
+        <root>/
+            22/
+                22_AMUSEMENT_STIMULUS_MUSE.json
+                22_AMUSEMENT_STIMULUS_EMPATICA.json    ← ignored
+                22_AMUSEMENT_QUESTIONNAIRES_MUSE.json  ← ignored
+                22_AMUSEMENT_WASHOUT_MUSE.json         ← ignored
+                22_ANGER_STIMULUS_MUSE.json
+                ...
+            23/
+                ...
     """
     patterns = [
-        os.path.join(cfg.data_path, "*_STIMULUS_MUSE.json"),
-        os.path.join(cfg.data_path, "*", "*_STIMULUS_MUSE.json"),
-        os.path.join(cfg.data_path, "*", "*", "*_STIMULUS_MUSE.json"),
+        os.path.join(cfg.data_path, "*", "*.json"),       # per-subject subfolder (real)
+        os.path.join(cfg.data_path, "*.json"),            # flat fallback
+        os.path.join(cfg.data_path, "*", "*", "*.json"),  # two-level fallback
     ]
     files = sorted({p for pat in patterns for p in glob.glob(pat)})
+
     subjects = set()
     for fpath in files:
         fname = os.path.basename(fpath)
-        if "BASELINE" in fname:
+        if not _emog_is_stimulus_muse(fname):
             continue
-        parts = fname.split("_")
-        if len(parts) >= 2:
-            emotion = parts[1].upper()
-            if emotion in cfg.emognition_class_map:
-                subjects.add(parts[0])
+        emotion = _emog_parse_emotion(fname)
+        if emotion in cfg.emognition_class_map:
+            subjects.add(_emog_parse_subject(fname))
     return sorted(subjects)
 
 
 def _emog_find_trials(subject_id: str, cfg: PCRConfig) -> List[Tuple[str, int]]:
     """
-    Return list of (file_path, label_int) for all valid trials of one subject.
-    Baseline files are excluded.
+    Return list of (file_path, label_int) for all STIMULUS_MUSE trials
+    of one subject.
+
+    Searches:
+        1. <root>/<subject_id>/   ← real layout (numeric subfolder)
+        2. <root>/                ← flat fallback
     """
     patterns = [
-        os.path.join(cfg.data_path, f"{subject_id}_*_STIMULUS_MUSE.json"),
-        os.path.join(cfg.data_path, "*",    f"{subject_id}_*_STIMULUS_MUSE.json"),
-        os.path.join(cfg.data_path, "*", "*", f"{subject_id}_*_STIMULUS_MUSE.json"),
+        os.path.join(cfg.data_path, subject_id, "*.json"),   # real: numeric subfolder
+        os.path.join(cfg.data_path, "*.json"),                # flat fallback
+        os.path.join(cfg.data_path, "*", subject_id, "*.json"),  # two-level fallback
     ]
     files = sorted({p for pat in patterns for p in glob.glob(pat)})
+
     result = []
     for fpath in files:
         fname = os.path.basename(fpath)
-        if "BASELINE" in fname:
+        # Must be this subject's file
+        if _emog_parse_subject(fname) != subject_id:
             continue
-        parts = fname.split("_")
-        if len(parts) < 2:
+        # Must be STIMULUS + MUSE only
+        if not _emog_is_stimulus_muse(fname):
             continue
-        emotion = parts[1].upper()
+        emotion = _emog_parse_emotion(fname)
         label = cfg.emognition_class_map.get(emotion)
         if label is None:
             continue
         result.append((fpath, label))
-    return result
+    return sorted(result)  # deterministic order
 
 
 def load_emognition_subject_trials(
@@ -317,30 +366,42 @@ def load_emognition_subject_trials(
     cfg: PCRConfig,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[int]]:
     """
-    Load all trials for one Emognition subject, keeping each trial separate
-    so the CV can split at the trial level (no leakage).
+    Load all stimulus trials for one Emognition subject, keeping each trial
+    separate so the CV can split at the trial level (no leakage).
+
+    Real folder layout:
+        <root>/
+            <subject_id>/
+                <subject_id>_ENTHUSIASM_STIMULUS_MUSE.json
+                <subject_id>_FEAR_STIMULUS_MUSE.json
+                <subject_id>_NEUTRAL_STIMULUS_MUSE.json
+                <subject_id>_SADNESS_STIMULUS_MUSE.json
+                <subject_id>_BASELINE_STIMULUS_MUSE.json  ← ignored here
 
     Preprocessing per trial:
-        1. Discard first `lead_in_duration` seconds  (emotionally neutral lead-in)
-        2. Next `baseline_duration` seconds          → baseline
-        3. Remainder                                 → stimulus EEG
-        4. Baseline removal → Z-score → sliding window
+        1. Quality filter        (HSI ≤ 2, HeadBandOn = 1)
+        2. Lead-in trim          (discard first `lead_in_duration` s — emotionally neutral)
+        3. Baseline extraction   (next `baseline_duration` s after lead-in)
+        4. Baseline removal      (same algorithm as DEAP)
+        5. Per-channel Z-score
+        6. Sliding window        → windows [N, W, 4]
 
     Returns:
-        trials_2d    : list of [n_windows, W, 1, 1]  – dummy zeros (1D model)
+        trials_2d    : list of [n_windows, W, 1, 1]  – dummy zeros (1D model only)
         trials_1d    : list of [n_windows, W, 4]
-        trial_labels : list of int
+        trial_labels : list of int  (0=ENTHUSIASM, 1=NEUTRAL, 2=SADNESS, 3=FEAR)
     """
     trial_files = _emog_find_trials(subject_id, cfg)
     if not trial_files:
-        logger.warning(f"Emognition: no trials found for subject {subject_id}")
+        logger.warning(f"Emognition: no trials found for subject '{subject_id}'")
         return [], [], []
 
-    # Window size and step in samples (scale to 256 Hz)
-    window_size = cfg.window_size  * (cfg.sampling_rate // 128)
-    window_step = cfg.window_step  * (cfg.sampling_rate // 128)
+    # Window size/step scaled from the 128-Hz base to actual sampling rate (256 Hz)
+    window_size = cfg.window_size * (cfg.sampling_rate // 128)
+    window_step = cfg.window_step * (cfg.sampling_rate // 128)
 
-    # Minimum trial length needed: lead_in + baseline + at least 1 window
+    # Minimum raw samples needed before we can even attempt preprocessing:
+    #   lead_in + baseline + at least 1 full window
     min_samples = int(
         (cfg.lead_in_duration + cfg.baseline_duration) * cfg.sampling_rate
     ) + window_size
@@ -351,33 +412,33 @@ def load_emognition_subject_trials(
     for fpath, label in trial_files:
         fname = os.path.basename(fpath)
 
-        # ── Load & quality-filter ─────────────────────────────────────────
-        signal = _emog_read_json(fpath)   # [4, T] or None
+        # 1 – load + quality filter → [4, T]
+        signal = _emog_read_json(fpath)
         if signal is None:
             logger.warning(f"  Skipping {fname}: empty after quality filter")
             skipped += 1
             continue
 
-        # ── Minimum length check ──────────────────────────────────────────
+        # 2 – minimum length guard
         if signal.shape[1] < min_samples:
             logger.warning(
                 f"  Skipping {fname}: {signal.shape[1]} samples < "
                 f"minimum {min_samples} "
                 f"(lead_in={cfg.lead_in_duration}s + "
-                f"baseline={cfg.baseline_duration}s + 1 window)"
+                f"baseline={cfg.baseline_duration}s + 1 window @ {cfg.sampling_rate}Hz)"
             )
             skipped += 1
             continue
 
-        # ── Preprocessing ─────────────────────────────────────────────────
+        # 3-6 – full preprocessing pipeline
         try:
             windows_2d, windows_1d = preprocess_trial_emognition(
-                trial_eeg        = signal,
-                sampling_rate    = cfg.sampling_rate,
-                lead_in_duration = cfg.lead_in_duration,
-                baseline_duration= cfg.baseline_duration,
-                window_size      = window_size,
-                step             = window_step,
+                trial_eeg         = signal,            # [4, T]
+                sampling_rate     = cfg.sampling_rate,
+                lead_in_duration  = cfg.lead_in_duration,
+                baseline_duration = cfg.baseline_duration,
+                window_size       = window_size,
+                step              = window_step,
             )
         except ValueError as e:
             logger.warning(f"  Skipping {fname}: {e}")

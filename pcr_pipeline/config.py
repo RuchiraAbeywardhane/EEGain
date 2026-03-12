@@ -18,18 +18,21 @@ class PCRConfig:
     ground_truth_threshold: float = 4.5  # binary split threshold (DEAP only)
 
     # ── Emognition-specific labels ────────────────────────────────────────────
-    # Maps emotion name → integer class index.
-    # Change this dict to collapse or rename classes.
+    # Only these 4 emotions are used. Files for other emotions are ignored.
+    #   0 = ENTHUSIASM
+    #   1 = NEUTRAL
+    #   2 = FEAR
+    #   3 = SADNESS
     emognition_class_map: dict = field(default_factory=lambda: {
         "ENTHUSIASM": 0,
         "NEUTRAL":    1,
-        "SADNESS":    2,
-        "FEAR":       3,
+        "FEAR":       2,
+        "SADNESS":    3,
     })
 
     # ── Shared label config (auto-set by dataset loader) ─────────────────────
-    n_classes: int = 2
-    class_names: List[str] = field(default_factory=lambda: ["low", "high"])
+    n_classes: int = 4
+    class_names: List[str] = field(default_factory=lambda: ["enthusiasm", "neutral", "fear", "sadness"])
 
     # ── Signal properties ─────────────────────────────────────────────────────
     sampling_rate: int = 128             # Hz  — 128 for DEAP, 256 for Emognition
@@ -59,7 +62,6 @@ class PCRConfig:
     window_step: int = 128             # stride between windows (128 = no overlap)
 
     # ── CNN branch ────────────────────────────────────────────────────────────
-    # Used by the 2D spatial CNN (DEAP) and the 1D temporal CNN (Emognition).
     cnn_filters: List[int] = field(default_factory=lambda: [32, 64, 128])
     cnn_kernel: int = 4                 # 4×4 for 2D (DEAP); kernel length for 1D (Emognition)
     cnn_reduce_filters: int = 13        # 1×1 fusion filters (2D path only)
