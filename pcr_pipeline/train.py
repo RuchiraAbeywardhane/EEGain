@@ -146,7 +146,7 @@ def train_fold(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3, verbose=False
+        optimizer, mode="min", factor=0.5, patience=3
     )
 
     best_val_loss   = float("inf")
