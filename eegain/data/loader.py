@@ -194,6 +194,28 @@ class EEGDataloader:
     def loso_fixed(self, train_subject_ids, test_subject_ids, **kwargs) -> Dict[str, Any]:
         logger.info(f"Splitting type: leave-n-subject-out-fixed")
 
+        # Filter out any subject IDs that don't exist in the dataset
+        available = set(self.dataset.__get_subject_ids__())
+
+        orig_train = list(train_subject_ids)
+        orig_test  = list(test_subject_ids)
+        train_subject_ids = [i for i in orig_train if str(i) in available or i in available]
+        test_subject_ids  = [i for i in orig_test  if str(i) in available or i in available]
+
+        skipped_train = [i for i in orig_train if i not in train_subject_ids]
+        skipped_test  = [i for i in orig_test  if i not in test_subject_ids]
+        if skipped_train:
+            logger.warning(f"Skipping missing train subjects (not in dataset): {skipped_train}")
+        if skipped_test:
+            logger.warning(f"Skipping missing test subjects (not in dataset): {skipped_test}")
+
+        if not train_subject_ids:
+            raise ValueError("No valid train subjects found after filtering. "
+                             "Check test_subjects.json or --train_subjects.")
+        if not test_subject_ids:
+            raise ValueError("No valid test subjects found after filtering. "
+                             "Check test_subjects.json or --test_subjects.")
+
         logger.debug(f"Preparing: train subjects: {train_subject_ids}")
         train_data = [self.dataset.__get_subject__(i) for i in train_subject_ids]
         train_data, train_label, train_videos = EEGDataloader._concat_data(train_data)
@@ -205,25 +227,25 @@ class EEGDataloader:
         logger.debug(f"test data shape {test_data.shape}")
 
         train_data, test_data = EEGDataloader.normalize(train_data, test_data)
-        
-        # Split training data into train and validation sets (80-20)
+
+        # Split training data into train and validation sets
         train_ratio = kwargs.get('train_val_split', 0.8)
         train_data, train_label, val_data, val_label, train_videos, val_videos = self.split_train_val(
             train_data, train_label, train_ratio=train_ratio, videos=train_videos)
 
         train_dataloader = self._get_dataloader(train_data, train_label)
-        val_dataloader = self._get_dataloader(val_data, val_label, shuffle=False)
-        test_dataloader = self._get_dataloader(test_data, test_label, shuffle=False)
-        
+        val_dataloader   = self._get_dataloader(val_data,   val_label,   shuffle=False)
+        test_dataloader  = self._get_dataloader(test_data,  test_label,  shuffle=False)
+
         return {
             "train": train_dataloader,
-            "val": val_dataloader,
-            "test": test_dataloader,
-            "test_subject_indexes": test_subject_ids,
+            "val":   val_dataloader,
+            "test":  test_dataloader,
+            "test_subject_indexes":  test_subject_ids,
             "train_subject_indexes": train_subject_ids,
             "train_videos": train_videos,
-            "val_videos": val_videos,
-            "test_videos": test_videos,
+            "val_videos":   val_videos,
+            "test_videos":  test_videos,
         }
 
     def split_train_val(self, data, label, train_ratio=0.8, shuffle=True, videos=None):
