@@ -128,31 +128,55 @@ class EEGDataloader:
         train_data: torch.Tensor, test_data: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        this function do standard normalization for EEG channel by channel
-        Args:
-            train_data (torch.Tensor): training data
-            test_data (torch.Tensor): testing data
-
-        Returns:
-            normalized training and testing data
+        Standard normalization for EEG channel by channel.
+        Fits mean/std on train_data, applies to both train and test.
+        Handles both 3D (B, C, T) and 4D (B, 1, C, T) input — always returns 4D.
         """
-        # data: sample x 1 x channel x data
         if len(train_data.shape) != 4:
-          train_data = train_data.unsqueeze(1)
-          test_data = test_data.unsqueeze(1)
-        for channel in range(train_data.shape[2]):
-            #this is for important for amigos and maybe dreame
-            #TODO: why do they have nan values???
-            nan_mask = torch.isnan(train_data[:, :, channel, :])  
-            train_data[:, :, channel, :][nan_mask] = 0
+            train_data = train_data.unsqueeze(1)
+        if len(test_data.shape) != 4:
+            test_data = test_data.unsqueeze(1)
 
-            nan_mask = torch.isnan(test_data[:, :, channel, :])  
+        for channel in range(train_data.shape[2]):
+            nan_mask = torch.isnan(train_data[:, :, channel, :])
+            train_data[:, :, channel, :][nan_mask] = 0
+            nan_mask = torch.isnan(test_data[:, :, channel, :])
             test_data[:, :, channel, :][nan_mask] = 0
-            
+
             std, mean = torch.std_mean(train_data[:, :, channel, :])
             train_data[:, :, channel, :] = (train_data[:, :, channel, :] - mean) / std
             test_data[:, :, channel, :] = (test_data[:, :, channel, :] - mean) / std
+
         return train_data, test_data
+
+    @staticmethod
+    def normalize_splits(
+        train_data: torch.Tensor,
+        *other_splits: torch.Tensor
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        Normalize any number of splits using train_data statistics.
+        Returns (train_data, split1, split2, ...) all as 4D tensors.
+        """
+        if len(train_data.shape) != 4:
+            train_data = train_data.unsqueeze(1)
+        others = [s.unsqueeze(1) if len(s.shape) != 4 else s for s in other_splits]
+
+        for channel in range(train_data.shape[2]):
+            # Fix NaNs in train
+            nan_mask = torch.isnan(train_data[:, :, channel, :])
+            train_data[:, :, channel, :][nan_mask] = 0
+
+            std, mean = torch.std_mean(train_data[:, :, channel, :])
+
+            train_data[:, :, channel, :] = (train_data[:, :, channel, :] - mean) / std
+
+            for s in others:
+                nan_mask = torch.isnan(s[:, :, channel, :])
+                s[:, :, channel, :][nan_mask] = 0
+                s[:, :, channel, :] = (s[:, :, channel, :] - mean) / std
+
+        return (train_data, *others)
 
     def loso(self, subject_out_num: int = 1, **kwargs) -> Dict[str, Any]:
         logger.info(f"Splitting type: leave-one-subject-out")
@@ -251,10 +275,10 @@ class EEGDataloader:
         test_data, test_label, test_videos = EEGDataloader._concat_data(test_data)
         logger.debug(f"test data shape {test_data.shape}")
 
-        # Normalise: fit scaler on train only, apply to val + test
-        train_data, val_data  = EEGDataloader.normalize(train_data, val_data)
-        # Re-use train stats for test normalisation
-        train_data, test_data = EEGDataloader.normalize(train_data, test_data)
+        # Normalise: fit scaler on train only, apply to val + test in one pass
+        train_data, val_data, test_data = EEGDataloader.normalize_splits(
+            train_data, val_data, test_data
+        )
 
         train_dataloader = self._get_dataloader(train_data, train_label)
         val_dataloader   = self._get_dataloader(val_data,   val_label,   shuffle=False)
