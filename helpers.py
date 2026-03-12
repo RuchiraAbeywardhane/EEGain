@@ -436,7 +436,7 @@ def loso_loop(model, loader, logger, **kwargs):
         # ReduceLROnPlateau: halves LR when val loss stops improving
         # more effective than CosineAnnealing for early stopping scenarios
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=3, verbose=True
+            optimizer, mode='min', factor=0.5, patience=3
         )
         is_random = False
     class_weights = compute_class_weights(loader["train"], kwargs["num_classes"])
