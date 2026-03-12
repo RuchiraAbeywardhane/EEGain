@@ -210,28 +210,51 @@ class EEGDataloader:
             logger.warning(f"Skipping missing test subjects (not in dataset): {skipped_test}")
 
         if not train_subject_ids:
-            raise ValueError("No valid train subjects found after filtering. "
-                             "Check test_subjects.json or --train_subjects.")
+            raise ValueError("No valid train subjects found after filtering.")
         if not test_subject_ids:
-            raise ValueError("No valid test subjects found after filtering. "
-                             "Check test_subjects.json or --test_subjects.")
+            raise ValueError("No valid test subjects found after filtering.")
 
+        # ----------------------------------------------------------------
+        # Subject-level train/val split — val subjects are DIFFERENT people
+        # from train subjects, preventing subject-identity leakage.
+        # ----------------------------------------------------------------
+        train_ratio = kwargs.get('train_val_split', 0.8)
+        n_val = max(1, int(len(train_subject_ids) * (1.0 - train_ratio)))
+
+        rng = np.random.default_rng(kwargs.get('random_seed', 42))
+        shuffled = list(train_subject_ids)
+        rng.shuffle(shuffled)
+        val_subject_ids   = shuffled[:n_val]
+        train_subject_ids = shuffled[n_val:]
+
+        logger.info(f"Subject-level split — "
+                    f"train: {len(train_subject_ids)} subjects, "
+                    f"val: {len(val_subject_ids)} subjects, "
+                    f"test: {len(test_subject_ids)} subjects")
+        logger.debug(f"Val subjects: {val_subject_ids}")
+
+        # ----------------------------------------------------------------
+        # Load data for each split
+        # ----------------------------------------------------------------
         logger.debug(f"Preparing: train subjects: {train_subject_ids}")
         train_data = [self.dataset.__get_subject__(i) for i in train_subject_ids]
         train_data, train_label, train_videos = EEGDataloader._concat_data(train_data)
         logger.debug(f"train data shape {train_data.shape}")
+
+        logger.debug(f"Preparing: val subjects: {val_subject_ids}")
+        val_data = [self.dataset.__get_subject__(i) for i in val_subject_ids]
+        val_data, val_label, val_videos = EEGDataloader._concat_data(val_data)
+        logger.debug(f"val data shape {val_data.shape}")
 
         logger.debug(f"Preparing: test subjects: {test_subject_ids}")
         test_data = [self.dataset.__get_subject__(i) for i in test_subject_ids]
         test_data, test_label, test_videos = EEGDataloader._concat_data(test_data)
         logger.debug(f"test data shape {test_data.shape}")
 
+        # Normalise: fit scaler on train only, apply to val + test
+        train_data, val_data  = EEGDataloader.normalize(train_data, val_data)
+        # Re-use train stats for test normalisation
         train_data, test_data = EEGDataloader.normalize(train_data, test_data)
-
-        # Split training data into train and validation sets
-        train_ratio = kwargs.get('train_val_split', 0.8)
-        train_data, train_label, val_data, val_label, train_videos, val_videos = self.split_train_val(
-            train_data, train_label, train_ratio=train_ratio, videos=train_videos)
 
         train_dataloader = self._get_dataloader(train_data, train_label)
         val_dataloader   = self._get_dataloader(val_data,   val_label,   shuffle=False)
@@ -243,6 +266,7 @@ class EEGDataloader:
             "test":  test_dataloader,
             "test_subject_indexes":  test_subject_ids,
             "train_subject_indexes": train_subject_ids,
+            "val_subject_indexes":   val_subject_ids,
             "train_videos": train_videos,
             "val_videos":   val_videos,
             "test_videos":  test_videos,
