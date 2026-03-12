@@ -203,57 +203,70 @@ def train_fold(
 # ── 10-fold cross-validation ──────────────────────────────────────────────────
 
 def run_10fold_cv(
-    X_2d: np.ndarray,
-    X_1d: np.ndarray,
-    y: np.ndarray,
+    trials_2d: List[np.ndarray],
+    trials_1d: List[np.ndarray],
+    trial_labels: List[int],
     cfg: PCRConfig,
 ) -> Dict:
     """
-    Perform stratified 10-fold cross-validation on the given data.
+    Perform stratified 10-fold cross-validation splitting at the TRIAL level.
+
+    The 40 trials are split into folds.  Windows are only expanded AFTER the
+    split, so no window from a trial ever appears in both train and test.
 
     For each fold:
-        - 80 % of train indices → training set
-        - 20 % of train indices → validation set  (class-balanced)
-        - held-out fold         → test set
+        held-out fold trials              → test  windows
+        remaining trials, last 20 % each class → val   windows
+        remaining trials, first 80% each class → train windows
 
     Args:
-        X_2d : [N, W, H, W_grid]
-        X_1d : [N, W, C]
-        y    : [N]
-        cfg  : PCRConfig
-
-    Returns:
-        summary dict with per-fold results and mean ± std metrics
+        trials_2d    : list of N_trials arrays  [n_windows, W, 9, 9]
+        trials_1d    : list of N_trials arrays  [n_windows, W, 32]
+        trial_labels : list of N_trials ints
+        cfg          : PCRConfig
     """
-    skf = StratifiedKFold(n_splits=cfg.n_folds, shuffle=True, random_state=cfg.seed)
+    trial_labels_np = np.array(trial_labels)
+    n_trials = len(trial_labels)
+    trial_idx_all = np.arange(n_trials)
 
+    skf = StratifiedKFold(n_splits=cfg.n_folds, shuffle=True, random_state=cfg.seed)
     fold_results = []
 
-    for fold_idx, (train_val_idx, test_idx) in enumerate(skf.split(X_2d, y)):
+    for fold_idx, (train_val_trial_idx, test_trial_idx) in enumerate(
+        skf.split(trial_idx_all, trial_labels_np)
+    ):
         print(f"\n{'='*60}")
-        print(f"  FOLD {fold_idx + 1} / {cfg.n_folds}")
+        print(f"  FOLD {fold_idx + 1} / {cfg.n_folds}  "
+              f"(train+val trials={len(train_val_trial_idx)}, test trials={len(test_trial_idx)})")
         print(f"{'='*60}")
 
-        # Split train_val into train (80%) + val (20%), class-balanced
-        train_val_labels = y[train_val_idx]
-        unique_classes   = np.unique(train_val_labels)
+        # ── Trial-level train / val split (class-balanced, 80/20) ────────
+        tv_labels = trial_labels_np[train_val_trial_idx]
         train_rel, val_rel = [], []
-
         rng = np.random.default_rng(cfg.seed + fold_idx)
-        for cls in unique_classes:
-            cls_mask = np.where(train_val_labels == cls)[0]
+        for cls in np.unique(tv_labels):
+            cls_mask = np.where(tv_labels == cls)[0]
             rng.shuffle(cls_mask)
-            split = int(len(cls_mask) * 0.8)
+            split = max(1, int(len(cls_mask) * 0.8))
             train_rel.extend(cls_mask[:split].tolist())
             val_rel.extend(cls_mask[split:].tolist())
 
-        train_idx = train_val_idx[train_rel]
-        val_idx   = train_val_idx[val_rel]
+        train_trial_idx = train_val_trial_idx[train_rel]
+        val_trial_idx   = train_val_trial_idx[val_rel]
 
-        # Build DEAPWindowDataset subsets directly from numpy slices
-        train_ds = DEAPWindowDataset(X_2d[train_idx], X_1d[train_idx], y[train_idx])
-        val_ds   = DEAPWindowDataset(X_2d[val_idx],   X_1d[val_idx],   y[val_idx])
-        test_ds  = DEAPWindowDataset(X_2d[test_idx],  X_1d[test_idx],  y[test_idx])
+        # ── Expand trials → windows AFTER the split ───────────────────────
+        def trials_to_dataset(idx_list):
+            x2 = np.concatenate([trials_2d[i] for i in idx_list], axis=0)
+            x1 = np.concatenate([trials_1d[i] for i in idx_list], axis=0)
+            yy = np.concatenate(
+                [np.full(trials_2d[i].shape[0], trial_labels[i], dtype=np.int64)
+                 for i in idx_list], axis=0
+            )
+            return DEAPWindowDataset(x2, x1, yy)
+
+        train_ds = trials_to_dataset(train_trial_idx)
+        val_ds   = trials_to_dataset(val_trial_idx)
+        test_ds  = trials_to_dataset(test_trial_idx)
 
         result = train_fold(train_ds, val_ds, test_ds, cfg, fold_idx)
         fold_results.append(result)
@@ -263,11 +276,11 @@ def run_10fold_cv(
     f1s  = [r["test_f1"]  for r in fold_results]
 
     summary = {
-        "fold_results":  fold_results,
-        "mean_acc":      float(np.mean(accs)),
-        "std_acc":       float(np.std(accs)),
-        "mean_f1":       float(np.mean(f1s)),
-        "std_f1":        float(np.std(f1s)),
+        "fold_results": fold_results,
+        "mean_acc":     float(np.mean(accs)),
+        "std_acc":      float(np.std(accs)),
+        "mean_f1":      float(np.mean(f1s)),
+        "std_f1":       float(np.std(f1s)),
     }
 
     print(f"\n{'='*60}")

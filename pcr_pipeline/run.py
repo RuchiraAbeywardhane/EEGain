@@ -30,7 +30,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pcr_pipeline.config  import PCRConfig
-from pcr_pipeline.dataset import load_subject, get_subject_ids
+from pcr_pipeline.dataset import load_subject_trials, get_subject_ids
 from pcr_pipeline.train   import run_10fold_cv, save_results
 
 
@@ -101,34 +101,31 @@ def main():
     logger.info(f"Label  : {cfg.label_type}  |  Threshold : {cfg.ground_truth_threshold}")
     logger.info(f"Config : {cfg}")
 
-    # ── Load data ─────────────────────────────────────────────────────────────
+    # ── Load data  (trial-level, no leakage) ─────────────────────────────────
     if args.subject:
         logger.info(f"Loading subject {args.subject:02d} …")
-        X_2d, X_1d, y = load_subject(args.subject, cfg)
+        trials_2d, trials_1d, trial_labels = load_subject_trials(args.subject, cfg)
         log_name = f"subject_{args.subject:02d}_{cfg.label_type}"
     else:
         subject_ids = get_subject_ids(cfg)
         logger.info(f"Found {len(subject_ids)} subjects: {subject_ids}")
-        all_2d, all_1d, all_y = [], [], []
+        trials_2d, trials_1d, trial_labels = [], [], []
         for sid in subject_ids:
             logger.info(f"  Loading subject {sid:02d} …")
-            x2, x1, yy = load_subject(sid, cfg)
-            all_2d.append(x2)
-            all_1d.append(x1)
-            all_y.append(yy)
-        X_2d = np.concatenate(all_2d, axis=0)
-        X_1d = np.concatenate(all_1d, axis=0)
-        y    = np.concatenate(all_y,  axis=0)
+            t2, t1, tl = load_subject_trials(sid, cfg)
+            trials_2d.extend(t2)
+            trials_1d.extend(t1)
+            trial_labels.extend(tl)
         log_name = f"all_subjects_{cfg.label_type}"
 
+    total_windows = sum(t.shape[0] for t in trials_2d)
     logger.info(
-        f"Data ready — windows: {X_2d.shape[0]} | "
-        f"2D shape: {X_2d.shape[1:]} | 1D shape: {X_1d.shape[1:]} | "
-        f"class dist: {np.bincount(y).tolist()}"
+        f"Data ready — {len(trials_2d)} trials | {total_windows} total windows | "
+        f"class dist (trials): {[trial_labels.count(c) for c in range(cfg.n_classes)]}"
     )
 
-    # ── Run 10-fold CV ────────────────────────────────────────────────────────
-    summary = run_10fold_cv(X_2d, X_1d, y, cfg)
+    # ── Run 10-fold CV  (split at trial level) ────────────────────────────────
+    summary = run_10fold_cv(trials_2d, trials_1d, trial_labels, cfg)
 
     # ── Save results ──────────────────────────────────────────────────────────
     os.makedirs(cfg.log_dir, exist_ok=True)

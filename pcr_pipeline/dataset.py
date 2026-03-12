@@ -50,21 +50,18 @@ def _subject_filename(subject_id: int) -> str:
     return f"s{subject_id:02d}.dat"
 
 
-def load_subject(
+def load_subject_trials(
     subject_id: int,
     cfg: PCRConfig,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[int]]:
     """
-    Load, preprocess and window all 40 trials for one DEAP subject.
-
-    Args:
-        subject_id : 1-indexed subject number (1..32)
-        cfg        : PCRConfig
+    Load and preprocess all 40 trials for one subject, keeping each trial
+    as a SEPARATE entry so the CV can split at the trial level (not window level).
 
     Returns:
-        X_2d : float32  [N, window_size, grid_size, grid_size]
-        X_1d : float32  [N, window_size, n_eeg_channels]
-        y    : int64    [N]
+        trials_2d : list of 40 arrays, each [n_windows, W, 9, 9]
+        trials_1d : list of 40 arrays, each [n_windows, W, 32]
+        trial_labels : list of 40 ints  (one label per trial)
     """
     fpath = os.path.join(cfg.data_path, _subject_filename(subject_id))
     subject_data = _load_subject_file(fpath)
@@ -75,16 +72,13 @@ def load_subject(
     label_idx = _LABEL_IDX.get(cfg.label_type.upper(), 0)
     threshold  = cfg.ground_truth_threshold
 
-    all_2d, all_1d, all_y = [], [], []
+    trials_2d, trials_1d, trial_labels = [], [], []
 
     for trial_idx in range(cfg.n_trials):
-        full_signal = raw_data[trial_idx, :_N_EEG_CHANNELS, :]  # [32, 8064]
+        full_signal  = raw_data[trial_idx, :_N_EEG_CHANNELS, :]  # [32, 8064]
+        baseline_eeg = full_signal[:, :_BASELINE_SAMPLES]         # [32, 384]
+        trial_eeg    = full_signal[:, _BASELINE_SAMPLES:]         # [32, 7680]
 
-        # Split baseline and stimulus
-        baseline_eeg = full_signal[:, :_BASELINE_SAMPLES]        # [32, 384]
-        trial_eeg    = full_signal[:, _BASELINE_SAMPLES:]        # [32, 7680]
-
-        # Full preprocessing pipeline
         windows_2d, windows_1d = preprocess_trial(
             trial_eeg    = trial_eeg,
             baseline_eeg = baseline_eeg,
@@ -92,25 +86,46 @@ def load_subject(
             grid_size    = cfg.grid_size,
             window_size  = cfg.window_size,
             step         = cfg.window_step,
-        )  # [N, W, 9, 9],  [N, W, 32]
+        )  # [60, W, 9, 9],  [60, W, 32]
 
-        # Label: 0 = low, 1 = high
         raw_score = float(raw_labels[trial_idx, label_idx])
         label = 0 if raw_score <= threshold else 1
 
-        n_windows = windows_2d.shape[0]
-        all_2d.append(windows_2d)
-        all_1d.append(windows_1d)
-        all_y.append(np.full(n_windows, label, dtype=np.int64))
+        trials_2d.append(windows_2d)
+        trials_1d.append(windows_1d)
+        trial_labels.append(label)
 
         logger.debug(
             f"  Subject {subject_id:02d} | trial {trial_idx:02d} | "
-            f"label={label} (score={raw_score:.1f}) | windows={n_windows}"
+            f"label={label} (score={raw_score:.1f}) | "
+            f"windows={windows_2d.shape[0]}"
         )
 
-    X_2d = np.concatenate(all_2d, axis=0)  # [N_total, W, 9, 9]
-    X_1d = np.concatenate(all_1d, axis=0)  # [N_total, W, 32]
-    y    = np.concatenate(all_y,  axis=0)  # [N_total]
+    logger.info(
+        f"Subject {subject_id:02d}: {cfg.n_trials} trials | "
+        f"class distribution: {[trial_labels.count(c) for c in range(cfg.n_classes)]}"
+    )
+    return trials_2d, trials_1d, trial_labels
+
+
+def load_subject(
+    subject_id: int,
+    cfg: PCRConfig,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Flat version (kept for compatibility). Returns concatenated windows.
+    Use load_subject_trials for CV to avoid leakage.
+    """
+    trials_2d, trials_1d, trial_labels = load_subject_trials(subject_id, cfg)
+    windows_per_trial = trials_2d[0].shape[0]
+
+    X_2d = np.concatenate(trials_2d, axis=0)
+    X_1d = np.concatenate(trials_1d, axis=0)
+    y    = np.array(
+        [lbl for lbl, t in zip(trial_labels, trials_2d)
+         for _ in range(t.shape[0])],
+        dtype=np.int64,
+    )
 
     logger.info(
         f"Subject {subject_id:02d}: {X_2d.shape[0]} windows | "
