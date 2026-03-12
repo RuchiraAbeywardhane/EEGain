@@ -1103,10 +1103,10 @@ class Emognition(EEGDataset):
 
     # Default emotion -> class mapping (can be overridden via config)
     DEFAULT_SUPERCLASS_MAP = {
-        "BOREDOM":  0,
+        "ENTHUSIASM":  0,
         "NEUTRAL":  1,
-        "NEGATIVE": 2,
-        "POSITIVE": 3,
+        "SADNESS": 2,
+        "FEAR": 3,
     }
 
     EEG_CHANNELS = ["TP9", "AF7", "AF8", "TP10"]
