@@ -209,47 +209,62 @@ def run_10fold_cv(
     cfg: PCRConfig,
 ) -> Dict:
     """
-    Perform stratified 10-fold cross-validation splitting at the TRIAL level.
+    Stratified K-fold CV splitting at the TRIAL level.
 
-    The 40 trials are split into folds.  Windows are only expanded AFTER the
-    split, so no window from a trial ever appears in both train and test.
-
-    For each fold:
-        held-out fold trials              → test  windows
-        remaining trials, last 20 % each class → val   windows
-        remaining trials, first 80% each class → train windows
-
-    Args:
-        trials_2d    : list of N_trials arrays  [n_windows, W, 9, 9]
-        trials_1d    : list of N_trials arrays  [n_windows, W, 32]
-        trial_labels : list of N_trials ints
-        cfg          : PCRConfig
+    n_folds is automatically capped to n_trials so it never exceeds the
+    number of samples.  For Emognition with 4 trials this becomes
+    Leave-One-Out (4 folds).
     """
     trial_labels_np = np.array(trial_labels)
     n_trials = len(trial_labels)
     trial_idx_all = np.arange(n_trials)
 
-    skf = StratifiedKFold(n_splits=cfg.n_folds, shuffle=True, random_state=cfg.seed)
+    # ── Cap folds to number of trials ────────────────────────────────────────
+    n_folds = min(cfg.n_folds, n_trials)
+    if n_folds < cfg.n_folds:
+        logger.warning(
+            f"n_folds capped from {cfg.n_folds} → {n_folds} "
+            f"(only {n_trials} trials available)"
+        )
+
+    # With very few trials, stratified split may fail if some classes have
+    # only 1 sample — fall back to plain KFold in that case.
+    try:
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=cfg.seed)
+        splits = list(skf.split(trial_idx_all, trial_labels_np))
+    except ValueError:
+        from sklearn.model_selection import KFold
+        logger.warning("StratifiedKFold failed — falling back to plain KFold")
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=cfg.seed)
+        splits = list(kf.split(trial_idx_all))
+
     fold_results = []
 
-    for fold_idx, (train_val_trial_idx, test_trial_idx) in enumerate(
-        skf.split(trial_idx_all, trial_labels_np)
-    ):
+    for fold_idx, (train_val_trial_idx, test_trial_idx) in enumerate(splits):
         print(f"\n{'='*60}")
-        print(f"  FOLD {fold_idx + 1} / {cfg.n_folds}  "
+        print(f"  FOLD {fold_idx + 1} / {n_folds}  "
               f"(train+val trials={len(train_val_trial_idx)}, test trials={len(test_trial_idx)})")
         print(f"{'='*60}")
 
-        # ── Trial-level train / val split (class-balanced, 80/20) ────────
+        # ── Trial-level train / val split (80/20, class-balanced where possible)
         tv_labels = trial_labels_np[train_val_trial_idx]
         train_rel, val_rel = [], []
         rng = np.random.default_rng(cfg.seed + fold_idx)
-        for cls in np.unique(tv_labels):
-            cls_mask = np.where(tv_labels == cls)[0]
-            rng.shuffle(cls_mask)
-            split = max(1, int(len(cls_mask) * 0.8))
-            train_rel.extend(cls_mask[:split].tolist())
-            val_rel.extend(cls_mask[split:].tolist())
+
+        if len(train_val_trial_idx) < 2:
+            # Only 1 train+val trial — use it for both train and val
+            train_rel = list(range(len(train_val_trial_idx)))
+            val_rel   = list(range(len(train_val_trial_idx)))
+        else:
+            for cls in np.unique(tv_labels):
+                cls_mask = np.where(tv_labels == cls)[0]
+                rng.shuffle(cls_mask)
+                split = max(1, int(len(cls_mask) * 0.8))
+                train_rel.extend(cls_mask[:split].tolist())
+                val_rel.extend(cls_mask[split:].tolist())
+            # Ensure val is never empty
+            if not val_rel:
+                val_rel = train_rel[-1:]
 
         train_trial_idx = train_val_trial_idx[train_rel]
         val_trial_idx   = train_val_trial_idx[val_rel]
@@ -271,7 +286,7 @@ def run_10fold_cv(
         result = train_fold(train_ds, val_ds, test_ds, cfg, fold_idx)
         fold_results.append(result)
 
-    # Summary
+    # ── Summary ───────────────────────────────────────────────────────────────
     accs = [r["test_acc"] for r in fold_results]
     f1s  = [r["test_f1"]  for r in fold_results]
 
@@ -284,7 +299,7 @@ def run_10fold_cv(
     }
 
     print(f"\n{'='*60}")
-    print(f"  10-FOLD CV SUMMARY")
+    print(f"  {n_folds}-FOLD CV SUMMARY")
     print(f"  Accuracy : {summary['mean_acc']:.4f} ± {summary['std_acc']:.4f}")
     print(f"  F1-score : {summary['mean_f1']:.4f} ± {summary['std_f1']:.4f}")
     print(f"{'='*60}\n")
