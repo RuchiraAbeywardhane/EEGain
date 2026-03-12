@@ -1279,6 +1279,88 @@ class Emognition(EEGDataset):
     def __get_subject_ids__(self) -> List[str]:
         return list(self.mapping_list.keys())
 
+    @staticmethod
+    def _min_samples_for_transform(transform, sampling_r: int) -> int:
+        """
+        Inspect the transform chain and return the minimum number of raw
+        samples needed so that Segment can produce at least one epoch.
+        Returns 0 if no Segment transform is found.
+        """
+        if transform is None:
+            return 0
+        transforms = getattr(transform, "transforms", [transform])
+        final_sr = sampling_r
+        duration = None
+        for t in transforms:
+            if hasattr(t, "sampling_r"):          # Resample
+                final_sr = t.sampling_r
+            if hasattr(t, "duration"):            # Segment
+                duration = t.duration
+        if duration is None:
+            return 0
+        return int(final_sr * duration) + 1       # +1 to be safe
+
+    def _load_and_transform(self, fpath: str, baseline) -> Tuple[Dict, Dict]:
+        """
+        Load one JSON file, apply quality filter + baseline, then run the
+        full transform chain.  Returns (data_array, label_array) with one
+        entry per window (after Segment) or one entry for the whole trial.
+        Returns ({}, {}) if the signal is too short or otherwise invalid.
+        """
+        fname = os.path.basename(fpath)
+        parts = fname.split("_")
+        emotion = parts[1].upper()
+        label = self.superclass_map.get(emotion)
+        if label is None:
+            return {}, {}
+
+        signal = Emognition._read_trial(fpath, self.use_baseline_reduction, baseline)
+        if signal is None:
+            logger.warning(f"Skipping empty trial: {fname}")
+            return {}, {}
+
+        # Guard: check signal is long enough for at least one segment
+        min_samples = Emognition._min_samples_for_transform(self.transform, self.sampling_r)
+        if min_samples > 0 and len(signal) < min_samples:
+            logger.warning(
+                f"Skipping {fname}: only {len(signal)} samples, "
+                f"need at least {min_samples} for one segment"
+            )
+            return {}, {}
+
+        info = mne.create_info(
+            ch_names=self.EEG_CHANNELS,
+            sfreq=self.sampling_r,
+            ch_types="eeg",
+        )
+        raw = mne.io.RawArray(signal.T, info, verbose=False)
+
+        if self.transform:
+            try:
+                raw = self.transform(raw)
+            except ValueError as e:
+                logger.warning(f"Skipping {fname}: transform failed — {e}")
+                return {}, {}
+
+        data_array: Dict[str, np.ndarray] = {}
+        label_array: Dict[str, int] = {}
+
+        # After Segment, raw is an mne.Epochs object: get_data() → (windows, C, T)
+        # Split each window into its own entry so _concat_data sees (1, C, T) arrays
+        if isinstance(raw, mne.BaseEpochs):
+            eeg_windows = raw.get_data()   # (windows, C, T)
+            for w_idx, window in enumerate(eeg_windows):
+                key = f"{fpath}::w{w_idx}"
+                data_array[key] = np.expand_dims(window, axis=0)  # (1, C, T)
+                label_array[key] = label
+        else:
+            # No Segment transform — store the whole trial as one entry
+            eeg = np.expand_dims(raw.get_data(), axis=0)          # (1, C, T)
+            data_array[fpath] = eeg
+            label_array[fpath] = label
+
+        return data_array, label_array
+
     def __get_subject__(
         self, subject_index: str
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, int]]:
@@ -1293,36 +1375,12 @@ class Emognition(EEGDataset):
         label_array: Dict[str, int] = {}
 
         for fpath in trial_paths:
-            fname = os.path.basename(fpath)
-            parts = fname.split("_")
-            emotion = parts[1].upper()
-            label = self.superclass_map[emotion]
-
-            signal = Emognition._read_trial(fpath, self.use_baseline_reduction, baseline)
-            if signal is None:
-                logger.warning(f"Skipping empty trial: {fname}")
-                continue
-
-            # Convert (T, 4) → MNE RawArray so transforms work
-            info = mne.create_info(
-                ch_names=self.EEG_CHANNELS,
-                sfreq=self.sampling_r,
-                ch_types="eeg",
-            )
-            # MNE expects (C, T)
-            raw = mne.io.RawArray(signal.T, info, verbose=False)
-
-            if self.transform:
-                raw = self.transform(raw)
-
-            # Shape after transform + get_data(): (C, T)
-            # Pipeline expects (1, C, T) — expand batch dim
-            eeg = np.expand_dims(raw.get_data(), axis=0)   # (1, C, T)
-            data_array[fpath] = eeg
-            label_array[fpath] = label
+            d, l = self._load_and_transform(fpath, baseline)
+            data_array.update(d)
+            label_array.update(l)
 
         logger.debug(
-            f"Subject {subject_index}: {len(data_array)} trials loaded"
+            f"Subject {subject_index}: {len(data_array)} windows loaded"
         )
         return data_array, label_array
 
@@ -1330,7 +1388,6 @@ class Emognition(EEGDataset):
         self, sessions: List[str], subject_ids
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, int]]:
         """Return specific trials (identified by file path) for LOTO splits."""
-        # sessions here are file paths (same keys used in mapping_list values)
         subject = os.path.basename(sessions[0]).split("_")[0] if sessions else ""
 
         baseline = None
@@ -1341,29 +1398,8 @@ class Emognition(EEGDataset):
         label_array: Dict[str, int] = {}
 
         for fpath in sessions:
-            fname = os.path.basename(fpath)
-            parts = fname.split("_")
-            emotion = parts[1].upper()
-            label = self.superclass_map.get(emotion)
-            if label is None:
-                continue
-
-            signal = Emognition._read_trial(fpath, self.use_baseline_reduction, baseline)
-            if signal is None:
-                continue
-
-            info = mne.create_info(
-                ch_names=self.EEG_CHANNELS,
-                sfreq=self.sampling_r,
-                ch_types="eeg",
-            )
-            raw = mne.io.RawArray(signal.T, info, verbose=False)
-
-            if self.transform:
-                raw = self.transform(raw)
-
-            eeg = np.expand_dims(raw.get_data(), axis=0)
-            data_array[fpath] = eeg
-            label_array[fpath] = label
+            d, l = self._load_and_transform(fpath, baseline)
+            data_array.update(d)
+            label_array.update(l)
 
         return data_array, label_array
