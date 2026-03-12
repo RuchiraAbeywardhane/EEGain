@@ -58,9 +58,8 @@ class CNNSpatialBranch(nn.Module):
         if conv_filters is None:
             conv_filters = [32, 64, 128]
 
-        pad = kernel_size // 2  # 'same' padding for 4×4 kernel → pad=2
+        pad = kernel_size // 2  # pad=2 for 4×4 kernel
 
-        # Three conv layers with BN + ELU (no pooling – frames are only 9×9)
         self.conv_layers = nn.Sequential(
             nn.Conv2d(1,               conv_filters[0], kernel_size, padding=pad, bias=False),
             nn.BatchNorm2d(conv_filters[0]),
@@ -75,16 +74,25 @@ class CNNSpatialBranch(nn.Module):
             nn.ELU(),
         )
 
-        # After processing each frame, we get [B*W, 128, H, W_grid].
-        # We reshape to [B, W*128, H, W_grid] and fuse with a 1×1 conv.
-        fused_channels = window_size * conv_filters[-1]  # W × 128
+        # ── Measure real spatial output size with a dummy pass ──────────
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, grid_size, grid_size)
+            dummy_out = self.conv_layers(dummy)          # [1, 128, H_out, W_out]
+            _, C_out, H_out, W_out = dummy_out.shape
+
+        self._H_out = H_out
+        self._W_out = W_out
+        self._C_feat = C_out
+
+        fused_channels = window_size * C_out            # W × 128
         self.fuse_conv = nn.Sequential(
             nn.Conv2d(fused_channels, reduce_filters, kernel_size=1, bias=False),
             nn.BatchNorm2d(reduce_filters),
             nn.ELU(),
         )
 
-        self.sfv_size = reduce_filters * grid_size * grid_size
+        # Real SFV size derived from actual conv output dimensions
+        self.sfv_size = reduce_filters * H_out * W_out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
