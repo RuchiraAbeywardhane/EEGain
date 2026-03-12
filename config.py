@@ -76,9 +76,10 @@ class EmognitionConfig:
 class TrainingConfig:
     batch_size: int = 32
     lr: float = 1e-4
-    weight_decay: float = 0.01
-    label_smoothing: float = 0.01
-    num_epochs: int = 30
+    weight_decay: float = 0.05        # increased: AdamW decouples it correctly now
+    label_smoothing: float = 0.1      # increased: stronger regularisation
+    num_epochs: int = 100             # high ceiling — early stopping will cut it
+    early_stopping_patience: int = 7  # stop after 7 epochs of no val_loss improvement
     log_dir: str = "logs/"
     overal_log_file: str = "logs.txt"
 

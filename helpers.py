@@ -153,7 +153,7 @@ def run_loto(
         prediction_dir = kwargs["log_predictions_dir"]
         # testID = test_ids[0]
         # if isinstance(testID, str) and '<EOF>' in testID:
-        #     testID = testID.split('<EOF>')[0]
+        #     testID = testID.split('<EOF>'[0])
             
         prediction_file = os.path.join(prediction_dir, f"predictions_LOTO_VideoID{testID}.csv")
         if not os.path.exists(prediction_file):
@@ -184,9 +184,8 @@ def run_loto(
                 best_model_state = copy.deepcopy(model.state_dict())
                 print(f"New best model found with validation accuracy: {val_acc:.4f}")
 
-            scheduler.step()
-            
-            #logger.log(subject_id, train_pred, train_actual, i, "train", train_loss)
+            scheduler.step(val_loss)
+            logger.log(subject_id, train_pred, train_actual, i, "train", train_loss)
 
         else:
             test_pred, test_actual, test_loss = test_one_epoch_random(
@@ -239,7 +238,7 @@ def run_loto(
 def run_loso(
         model,
         train_dataloader,
-        val_dataloader,  # New parameter for validation
+        val_dataloader,
         test_dataloader,
         test_subject_ids,
         optimizer,
@@ -249,97 +248,79 @@ def run_loso(
         logger,
         random_baseline,
         train_videos,
-        val_videos,     # New parameter for validation videos
+        val_videos,
         test_videos,
         **kwargs
 ):
-    best_val_acc = 0.0
+    best_val_loss = float('inf')
     best_model_state = None
-        
+    patience = kwargs.get("early_stopping_patience", 7)
+    patience_counter = 0
+
     print(f"test subject ids {test_subject_ids}")
-    
-    # Code to log predictions
+
     if kwargs.get("log_predictions", False) is True:
         prediction_dir = kwargs["log_predictions_dir"]
         prediction_file = os.path.join(prediction_dir, f"predictions_LOSO_SubjectID{test_subject_ids[0]}.csv")
         with open(prediction_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['Epoch', 'Data Part', 'Subject id', 'Video id', 'Actual', 'Predicted'])
-        
+
     for i in range(epoch):
         print(f"\nEpoch {i+1}/{epoch}")
         if not random_baseline:
-            # Training phase
             train_pred, train_actual, train_loss = train_one_epoch(
                 model, train_dataloader, optimizer, loss_fn
             )
-            
-            # Validation phase
             val_pred, val_actual, val_loss = test_one_epoch(
                 model, val_dataloader, loss_fn, val=True
             )
-            
-            # Compute validation accuracy
             val_acc = accuracy_score(val_actual, val_pred)
-            print(f"Validation accuracy: {val_acc:.4f}")
-            
-            # Save best model based on validation accuracy (in memory)
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            print(f"Validation accuracy: {val_acc:.4f}  val_loss: {val_loss:.4f}  "
+                  f"patience: {patience_counter}/{patience}")
+
+            # Save best on val LOSS (more stable than accuracy on small val sets)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 best_model_state = copy.deepcopy(model.state_dict())
-                print(f"New best model found with validation accuracy: {val_acc:.4f}")
-            
-            scheduler.step()
-            
-            # Log metrics for train and validation
+                patience_counter = 0
+                print(f"  ✓ New best val_loss: {val_loss:.4f}")
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"  ✗ Early stopping triggered at epoch {i+1}")
+                    break
+
+            scheduler.step(val_loss)
             logger.log(test_subject_ids[0], train_pred, train_actual, i, "train", train_loss)
-            #logger.log(test_subject_ids[0], val_pred, val_actual, i, "val", val_loss)
         else:
             test_pred, test_actual, test_loss = test_one_epoch_random(
                 model, test_dataloader, loss_fn
             )
             train_pred, train_actual, train_loss = test_pred, test_actual, test_loss
             val_pred, val_actual, val_loss = test_pred, test_actual, test_loss
-            # Logging
             logger.log(test_subject_ids[0], test_pred, test_actual, i, "test", test_loss)
-            # Log predictions if enabled
             if kwargs.get("log_predictions", False) is True:
                 with open(prediction_file, 'a', newline='') as f:
                     writer = csv.writer(f)
                     for act, pred, vid in zip(val_actual, val_pred, val_videos):
-                        # for SEED dataset, the video id is in the form of 'video_id<EOF>path'
                         if isinstance(vid, str) and '<EOF>' in vid:
                             vid = vid.split('<EOF>'[0])
-                        
                         writer.writerow([i, 'val', test_subject_ids[0], vid, act, pred])
-              
-                
-        # Log metrics for train and validation
-        #logger.log(test_subject_ids[0], train_pred, train_actual, i, "train", train_loss)
-        #logger.log(test_subject_ids[0], val_pred, val_actual, i, "val", val_loss)
-    
-    # Load the best model for final testing (from memory)
+
     if not random_baseline and best_model_state is not None:
         model.load_state_dict(best_model_state)
-        print("Using best model for testing based on validation performance")
-    
-        # Final test phase with best model
+        print(f"Using best model (val_loss={best_val_loss:.4f}) for testing")
         final_test_pred, final_test_actual, final_test_loss = test_one_epoch(
             model, test_dataloader, loss_fn
         )
-    
-        # Log test results
         logger.log(test_subject_ids[0], final_test_pred, final_test_actual, epoch, "test", final_test_loss)
-    
-        # Log test predictions if enabled
         if kwargs.get("log_predictions", False) is True:
             with open(prediction_file, 'a', newline='') as f:
                 writer = csv.writer(f)
                 for act, pred, vid in zip(final_test_actual, final_test_pred, test_videos):
-                    # for SEED dataset, the video id is in the form of 'video_id<EOF>path'
                     if isinstance(vid, str) and '<EOF>' in vid:
                         vid = vid.split('<EOF>'[0])
-                    
                     writer.writerow([epoch, 'test', test_subject_ids[0], vid, act, pred])
 
     logger.log_summary(overal_log_file="overal_log", log_dir="logs/")
@@ -446,10 +427,17 @@ def loso_loop(model, loader, logger, **kwargs):
         scheduler = None
     else:
         model = model.to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"],
-                                     weight_decay=kwargs["weight_decay"])
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=0)
-
+        # AdamW correctly decouples weight decay from gradient update (Adam does not)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=kwargs["lr"],
+            weight_decay=kwargs["weight_decay"]
+        )
+        # ReduceLROnPlateau: halves LR when val loss stops improving
+        # more effective than CosineAnnealing for early stopping scenarios
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        )
         is_random = False
     class_weights = compute_class_weights(loader["train"], kwargs["num_classes"])
     loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=kwargs["label_smoothing"])

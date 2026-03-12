@@ -171,8 +171,9 @@ def generate_options():
 @click.option("--test_subjects", default=None, type=str,
               help="Comma-separated test subject IDs for LOSO_Fixed, e.g. '60,61,62'")
 @click.option("--window_scales", default=None, type=str,
-              help="Comma-separated window durations in seconds for MultiScaleEEGNet, e.g. '2,4,8'. "
-                   "--window must equal the largest value.")
+              help="Comma-separated window durations in seconds for MultiScaleEEGNet, e.g. '2,4,8'.")
+@click.option("--early_stopping_patience", default=7, type=int,
+              help="Stop training after this many epochs with no val_loss improvement (default: 7)")
 # ---------- SVM flags ----------
 @click.option("--svm_kernel", default="rbf", type=click.Choice(["rbf", "linear", "poly", "sigmoid"]),
               help="SVM kernel type (default: rbf)")
