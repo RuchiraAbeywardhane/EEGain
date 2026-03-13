@@ -90,9 +90,13 @@ class TSception(nn.Module):
         fusion_kernel_h = min(3, n_spatial_rows)
         self.fusion_layer = TSception.conv_block(num_s, num_s, (fusion_kernel_h, 1), 1, 4)
 
-        self.BN_t = nn.BatchNorm2d(num_t)
-        self.BN_s = nn.BatchNorm2d(num_s)
-        self.BN_fusion = nn.BatchNorm2d(num_s)
+        # InstanceNorm2d instead of BatchNorm2d:
+        # - BatchNorm accumulates running stats from train subjects only.
+        #   At val/test time it applies those stats to different subjects → domain shift → flat val loss.
+        # - InstanceNorm normalises per sample, per channel — no running stats, immune to subject shift.
+        self.BN_t      = nn.InstanceNorm2d(num_t,  affine=True)
+        self.BN_s      = nn.InstanceNorm2d(num_s,  affine=True)
+        self.BN_fusion = nn.InstanceNorm2d(num_s,  affine=True)
 
         # Proper 2-layer classifier: num_s -> hidden -> num_classes
         # NO Softmax: nn.CrossEntropyLoss applies log-softmax internally.
