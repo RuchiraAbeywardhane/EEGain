@@ -98,30 +98,76 @@ def _per_class_metrics(
     }
 
 
+# ── Trial-level split ─────────────────────────────────────────────────────────
+
+def _trial_level_split(
+    trial_ids: np.ndarray,
+    labels:    np.ndarray,
+    test_size: float,
+    rng:       np.random.Generator,
+) -> tuple:
+    """
+    Split at the TRIAL level so that every window of a given trial lands
+    entirely in train OR entirely in test — never both.
+
+    Strategy
+    --------
+    1. Get the unique trial IDs and the majority class-label for each trial
+       (a trial's label is constant — all windows share the same emotion).
+    2. Stratify: for each class, shuffle its trial IDs and take the last
+       ceil(n_class_trials * test_size) as test trials.
+    3. Expand trial IDs back to window indices.
+
+    Returns
+    -------
+    train_idx, test_idx : np.ndarray of window-level integer indices
+    """
+    unique_tids = np.unique(trial_ids)
+
+    # Representative label for each trial (all windows are the same class)
+    tid_labels = np.array([
+        labels[trial_ids == tid][0] for tid in unique_tids
+    ])
+
+    train_tids, test_tids = [], []
+    for cls in np.unique(tid_labels):
+        cls_tids = unique_tids[tid_labels == cls]
+        rng.shuffle(cls_tids)
+        n_test   = max(1, int(np.ceil(len(cls_tids) * test_size)))
+        test_tids.extend(cls_tids[-n_test:].tolist())
+        train_tids.extend(cls_tids[:-n_test].tolist())
+
+    train_set = set(train_tids)
+    test_set  = set(test_tids)
+
+    train_idx = np.where(np.isin(trial_ids, list(train_set)))[0]
+    test_idx  = np.where(np.isin(trial_ids, list(test_set)))[0]
+
+    return train_idx, test_idx
+
+
 # ── Single repetition ────────────────────────────────────────────────────────
 
 def _run_one_rep(
-    X: np.ndarray,
-    y: np.ndarray,
-    cfg: WEAVEConfig,
-    rep_seed: int,
+    X:         np.ndarray,
+    y:         np.ndarray,
+    trial_ids: np.ndarray,
+    cfg:       WEAVEConfig,
+    rep_seed:  int,
     n_features_per_channel: int,
 ) -> Dict:
     """
-    One random 80/20 split → extract WEAVE → train SVM → evaluate.
-
-    Returns a dict with keys:
-        full_acc, full_f1,
-        reduced_acc, reduced_f1,
-        ranked_channels  (list of ints, best-first)
+    One trial-level 80/20 split → WEAVE extraction → train SVM → evaluate.
+    No window from a test trial is ever present in the training set.
     """
-    # ── Stratified 80/20 split ────────────────────────────────────────────
-    sss = StratifiedShuffleSplit(
-        n_splits    = 1,
-        test_size   = cfg.test_size,
-        random_state = rep_seed,
+    rng = np.random.default_rng(rep_seed)
+
+    train_idx, test_idx = _trial_level_split(
+        trial_ids = trial_ids,
+        labels    = y,
+        test_size = cfg.test_size,
+        rng       = rng,
     )
-    train_idx, test_idx = next(sss.split(X, y))
 
     segs_train, y_train = X[train_idx], y[train_idx]
     segs_test,  y_test  = X[test_idx],  y[test_idx]
@@ -175,34 +221,42 @@ def _run_one_rep(
         "red_per_class":   red_pc,
         "ranked_channels": ranked_indices.tolist(),
         "kept_channels":   keep_k,
+        "n_train_windows": len(train_idx),
+        "n_test_windows":  len(test_idx),
+        "n_train_trials":  len(np.unique(trial_ids[train_idx])),
+        "n_test_trials":   len(np.unique(trial_ids[test_idx])),
     }
 
 
 # ── 30-repetition evaluation ─────────────────────────────────────────────────
 
 def run_weave_evaluation(
-    segments: np.ndarray,
-    labels:   np.ndarray,
-    cfg: WEAVEConfig,
+    segments:  np.ndarray,
+    labels:    np.ndarray,
+    trial_ids: np.ndarray,
+    cfg:       WEAVEConfig,
 ) -> Dict:
     """
     Run the full WEAVE + SVM evaluation over cfg.n_repetitions random splits.
 
     Args:
-        segments : np.ndarray  shape [N, C, T]
-        labels   : np.ndarray  shape [N]
-        cfg      : WEAVEConfig
+        segments  : [N, C, T]
+        labels    : [N]
+        trial_ids : [N]  – integer trial ID per window (from dataset.load_data)
+        cfg       : WEAVEConfig
 
     Returns:
-        summary dict with per-repetition and aggregate results
+        summary dict
     """
-    n_feat_per_ch = 2 * len(cfg.retained_bands)   # entropy + mean per band
+    n_feat_per_ch  = 2 * len(cfg.retained_bands)
+    n_unique_trials = len(np.unique(trial_ids))
 
     logger.info(
         f"WEAVE evaluation | {cfg.dataset.upper()} | "
-        f"N={len(labels)} segments | {cfg.n_eeg_channels} channels | "
+        f"N={len(labels)} windows | {n_unique_trials} trials | "
+        f"{cfg.n_eeg_channels} channels | "
         f"{n_feat_per_ch * cfg.n_eeg_channels} total features | "
-        f"{cfg.n_repetitions} repetitions"
+        f"{cfg.n_repetitions} repetitions | split=TRIAL-LEVEL"
     )
 
     rep_results: List[Dict] = []
@@ -212,6 +266,7 @@ def run_weave_evaluation(
         result   = _run_one_rep(
             X                      = segments,
             y                      = labels,
+            trial_ids              = trial_ids,
             cfg                    = cfg,
             rep_seed               = rep_seed,
             n_features_per_channel = n_feat_per_ch,
@@ -220,9 +275,11 @@ def run_weave_evaluation(
 
         print(
             f"  Rep {rep + 1:2d}/{cfg.n_repetitions} | "
-            f"Full  acc={result['full_acc']:.4f}  f1={result['full_f1']:.4f} | "
+            f"train {result['n_train_trials']} trials/{result['n_train_windows']} win  "
+            f"test {result['n_test_trials']} trials/{result['n_test_windows']} win | "
+            f"Full acc={result['full_acc']:.4f} f1={result['full_f1']:.4f} | "
             f"Reduced({result['kept_channels']}ch) "
-            f"acc={result['reduced_acc']:.4f}  f1={result['reduced_f1']:.4f}"
+            f"acc={result['reduced_acc']:.4f} f1={result['reduced_f1']:.4f}"
         )
 
     return _summarise(rep_results, cfg)

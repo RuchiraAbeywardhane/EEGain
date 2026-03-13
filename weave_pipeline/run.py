@@ -219,30 +219,36 @@ def main():
     else:
         logger.info("Loading ALL subjects …")
 
-    segments, labels = load_data(cfg, subject_id=subject_id)
+    segments, labels, trial_ids = load_data(cfg, subject_id=subject_id)
 
     if segments.shape[0] == 0:
         logger.error("No data loaded — check data_path and subject ID.")
         return
 
+    n_unique_trials = len(np.unique(trial_ids))
     logger.info(
-        f"Loaded {segments.shape[0]} segments  |  shape {segments.shape}  |  "
+        f"Loaded {segments.shape[0]} segments  |  {n_unique_trials} trials  |  "
+        f"shape {segments.shape}  |  "
         f"class dist {np.bincount(labels, minlength=cfg.n_classes).tolist()}"
     )
 
-    # Guard: need at least n_classes samples per class for stratified splitting
-    counts = np.bincount(labels, minlength=cfg.n_classes)
-    min_count = counts[counts > 0].min()
-    if min_count < 2:
+    # Guard: need at least 2 trials per class for a meaningful trial-level split
+    unique_tids = np.unique(trial_ids)
+    tid_labels  = np.array([labels[trial_ids == tid][0] for tid in unique_tids])
+    min_trials_per_class = min(
+        int((tid_labels == cls).sum()) for cls in range(cfg.n_classes)
+        if (tid_labels == cls).sum() > 0
+    )
+    if min_trials_per_class < 2:
         logger.error(
-            f"Not enough samples per class for stratified splitting "
-            f"(min class count = {min_count}).  "
+            f"Not enough trials per class for trial-level splitting "
+            f"(min = {min_trials_per_class}).  "
             f"Use --all_subjects or check your data."
         )
         return
 
     # ── Run evaluation ────────────────────────────────────────────────────────
-    summary = run_weave_evaluation(segments, labels, cfg)
+    summary = run_weave_evaluation(segments, labels, trial_ids, cfg)
 
     # ── Save results ──────────────────────────────────────────────────────────
     os.makedirs(cfg.log_dir, exist_ok=True)

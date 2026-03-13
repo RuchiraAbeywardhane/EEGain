@@ -1,33 +1,33 @@
 """
 Dataset loaders for the WEAVE pipeline.
 
-Returns raw EEG segments of shape [N, C, T] and labels [N] — no neural-net
-preprocessing.  Feature extraction is done separately in features.py.
+Returns raw EEG segments [N, C, T], labels [N], and trial_ids [N].
+trial_ids is an integer array where every window that came from the same
+original recording (one JSON file / one DEAP trial) shares the same ID.
+The train.py splitter uses trial_ids to split at the TRIAL level so that
+no window from a test trial ever appears in the train set.
 
 DEAP
 ----
 File : s{id:02d}.dat  (pickle, latin-1)
-  data   [40, 40, 8064] – first 32 ch EEG; first 384 samples = 3 s baseline
-  labels [40,  4]       – valence, arousal, dominance, liking  (1–9 scale)
-
   Steps:
     1. Separate baseline (first 384 samples) from stimulus (remaining 7680 s)
-    2. Baseline-removal  (same averaging method as pcr_pipeline)
+    2. Baseline-removal
     3. Z-score per channel
-    4. Segment into non-overlapping windows of `segment_duration` seconds
+    4. Segment into non-overlapping 6-second windows
     5. Binary label: score > threshold → 1 (High), else → 0 (Low)
+    6. trial_id  = global_trial_counter (unique per subject × trial)
 
 Emognition
 ----------
 JSON files (STIMULUS_MUSE only, 4 EEG channels at 256 Hz):
   Steps:
     1. Quality filter  (HSI ≤ 2, HeadBandOn = 1)
-    2. Discard lead-in (first `lead_in_duration` s)
-    3. Extract baseline (next `baseline_duration` s)
-    4. Baseline-removal
-    5. Z-score per channel
-    6. Segment into non-overlapping windows of `segment_duration` seconds
-    7. Label from class_map (ENTHUSIASM=0, NEUTRAL=1, FEAR=2, SADNESS=3)
+    2. Discard lead-in  →  extract baseline  →  baseline-removal
+    3. Z-score per channel
+    4. Segment into non-overlapping 6-second windows
+    5. Label from class_map
+    6. trial_id = global_trial_counter (unique per subject × emotion file)
 """
 
 import os
@@ -42,37 +42,27 @@ from .config import WEAVEConfig
 
 logger = logging.getLogger("WEAVE.Dataset")
 
-# ── DEAP constants ────────────────────────────────────────────────────────────
+# ── DEAP constants ─────────────────────────────────────────────────────────────
 _LABEL_IDX        = {"V": 0, "A": 1, "D": 2, "L": 3}
-_BASELINE_SAMPLES = 384     # 3 s × 128 Hz
+_BASELINE_SAMPLES = 384      # 3 s × 128 Hz
 _N_EEG_CHANNELS   = 32
 _DEAP_SRATE       = 128
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  SHARED SIGNAL UTILITIES
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _baseline_removal(trial: np.ndarray, baseline: np.ndarray,
                       segment_len: int) -> np.ndarray:
-    """
-    Subtract averaged baseline from trial.
-    baseline shape : [C, T_base]
-    trial    shape : [C, T_trial]
-    Returns        : [C, T_trial]
-    """
     C, T_base = baseline.shape
     n_seg     = T_base // segment_len
     if n_seg == 0:
-        # baseline shorter than one segment — just subtract global mean
-        base_mean = baseline.mean(axis=1, keepdims=True)  # [C, 1]
-        return trial - base_mean
-
-    segs     = np.stack(
-        [baseline[:, i * segment_len:(i + 1) * segment_len]
-         for i in range(n_seg)], axis=0)
-    base_mean = segs.mean(axis=0)                     # [C, segment_len]
-
+        return trial - baseline.mean(axis=1, keepdims=True)
+    segs      = np.stack(
+        [baseline[:, i * segment_len:(i + 1) * segment_len] for i in range(n_seg)],
+        axis=0)
+    base_mean = segs.mean(axis=0)
     C_t, T_trial = trial.shape
     n_tiles   = T_trial // segment_len
     remainder = T_trial %  segment_len
@@ -83,7 +73,6 @@ def _baseline_removal(trial: np.ndarray, baseline: np.ndarray,
 
 
 def _zscore_1d(eeg: np.ndarray) -> np.ndarray:
-    """Per-channel Z-score normalisation.  eeg : [C, T]"""
     eeg = eeg.astype(np.float32, copy=True)
     for c in range(eeg.shape[0]):
         mu  = eeg[c].mean()
@@ -93,25 +82,19 @@ def _zscore_1d(eeg: np.ndarray) -> np.ndarray:
 
 
 def _segment_signal(eeg: np.ndarray, segment_samples: int) -> np.ndarray:
-    """
-    Cut [C, T] into non-overlapping windows of `segment_samples` samples.
-    Trailing samples that don't fill a complete window are discarded.
-
-    Returns : [N, C, segment_samples]
-    """
-    C, T    = eeg.shape
-    n_segs  = T // segment_samples
+    C, T   = eeg.shape
+    n_segs = T // segment_samples
     if n_segs == 0:
         return np.empty((0, C, segment_samples), dtype=np.float32)
-    segs = np.stack(
+    return np.stack(
         [eeg[:, i * segment_samples:(i + 1) * segment_samples]
-         for i in range(n_segs)], axis=0)
-    return segs.astype(np.float32)
+         for i in range(n_segs)], axis=0
+    ).astype(np.float32)
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  DEAP LOADER
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def get_deap_subject_ids(cfg: WEAVEConfig) -> List[int]:
     ids = []
@@ -127,13 +110,16 @@ def get_deap_subject_ids(cfg: WEAVEConfig) -> List[int]:
 def load_deap_subject(
     subject_id: int,
     cfg: WEAVEConfig,
-) -> Tuple[np.ndarray, np.ndarray]:
+    trial_id_offset: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load all 40 DEAP trials for one subject, extract segments.
+    Load all 40 DEAP trials for one subject.
 
     Returns:
-        segments : np.ndarray  shape [N, 32, segment_samples]
-        labels   : np.ndarray  shape [N]  int  (0=Low, 1=High)
+        segments  : [N, 32, segment_samples]
+        labels    : [N]   int
+        trial_ids : [N]   int  – one unique ID per original trial
+                                 IDs start from trial_id_offset
     """
     fpath = os.path.join(cfg.data_path, f"s{subject_id:02d}.dat")
     with open(fpath, "rb") as f:
@@ -142,65 +128,74 @@ def load_deap_subject(
     raw_data   = subject_data["data"]    # [40, 40, 8064]
     raw_labels = subject_data["labels"]  # [40, 4]
 
-    label_col      = _LABEL_IDX.get(cfg.label_type.upper(), 0)
-    threshold      = cfg.ground_truth_threshold
+    label_col       = _LABEL_IDX.get(cfg.label_type.upper(), 0)
+    threshold       = cfg.ground_truth_threshold
     segment_samples = int(cfg.segment_duration * _DEAP_SRATE)
-    segment_len    = _DEAP_SRATE                               # 1-s baseline avg
+    segment_len     = _DEAP_SRATE
 
-    all_segs, all_labels = [], []
+    all_segs, all_labels, all_tids = [], [], []
 
     for trial_idx in range(raw_data.shape[0]):
-        full  = raw_data[trial_idx, :_N_EEG_CHANNELS, :]      # [32, 8064]
-        base  = full[:, :_BASELINE_SAMPLES]                    # [32, 384]
-        trial = full[:, _BASELINE_SAMPLES:]                    # [32, 7680]
+        full  = raw_data[trial_idx, :_N_EEG_CHANNELS, :]
+        base  = full[:, :_BASELINE_SAMPLES]
+        trial = full[:, _BASELINE_SAMPLES:]
 
         trial_clean = _baseline_removal(trial, base, segment_len)
         trial_clean = _zscore_1d(trial_clean)
+        segs        = _segment_signal(trial_clean, segment_samples)
 
-        segs = _segment_signal(trial_clean, segment_samples)   # [N_s, 32, T_seg]
         if segs.shape[0] == 0:
             continue
 
         raw_score = float(raw_labels[trial_idx, label_col])
         label     = 1 if raw_score > threshold else 0
+        tid       = trial_id_offset + trial_idx   # unique across all subjects
 
         all_segs.append(segs)
         all_labels.extend([label] * segs.shape[0])
+        all_tids.extend([tid]    * segs.shape[0])
 
     if not all_segs:
         logger.warning(f"DEAP subject {subject_id:02d}: no segments produced")
-        return np.empty((0, _N_EEG_CHANNELS, segment_samples), dtype=np.float32), \
-               np.empty((0,), dtype=np.int64)
+        empty = np.empty((0, _N_EEG_CHANNELS, segment_samples), dtype=np.float32)
+        return empty, np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
 
-    segments = np.concatenate(all_segs, axis=0)
-    labels   = np.array(all_labels, dtype=np.int64)
+    segments  = np.concatenate(all_segs, axis=0)
+    labels    = np.array(all_labels, dtype=np.int64)
+    trial_ids = np.array(all_tids,   dtype=np.int64)
 
     logger.info(
         f"DEAP subject {subject_id:02d}: {segments.shape[0]} segments | "
+        f"{len(np.unique(trial_ids))} trials | "
         f"class dist {np.bincount(labels).tolist()}"
     )
-    return segments, labels
+    return segments, labels, trial_ids
 
 
 def load_deap_all_subjects(
     cfg: WEAVEConfig,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Pool all DEAP subjects into one segment matrix."""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pool all DEAP subjects. trial_ids are globally unique across subjects."""
     ids = get_deap_subject_ids(cfg)
-    all_segs, all_labels = [], []
+    all_segs, all_labels, all_tids = [], [], []
+    tid_offset = 0
     for sid in ids:
-        segs, labels = load_deap_subject(sid, cfg)
+        segs, labels, tids = load_deap_subject(sid, cfg, trial_id_offset=tid_offset)
         if segs.shape[0]:
             all_segs.append(segs)
             all_labels.append(labels)
+            all_tids.append(tids)
+            tid_offset = int(tids.max()) + 1   # next subject starts after last trial ID
     if not all_segs:
         raise RuntimeError("No DEAP segments loaded — check data_path.")
-    return np.concatenate(all_segs, axis=0), np.concatenate(all_labels, axis=0)
+    return (np.concatenate(all_segs,   axis=0),
+            np.concatenate(all_labels, axis=0),
+            np.concatenate(all_tids,   axis=0))
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  EMOGNITION LOADER  (reuses helpers from pcr_pipeline.dataset)
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  EMOGNITION LOADER
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _emog_to_num(x) -> np.ndarray:
     import pandas as pd
@@ -216,19 +211,18 @@ def _emog_to_num(x) -> np.ndarray:
 def _emog_interp_nan(a: np.ndarray) -> np.ndarray:
     a = a.astype(np.float64, copy=True)
     m = np.isfinite(a)
-    if m.all():   return a
+    if m.all():    return a
     if not m.any(): return np.zeros_like(a)
-    idx = np.arange(len(a))
+    idx  = np.arange(len(a))
     a[~m] = np.interp(idx[~m], idx[m], a[m])
     return a
 
 
 def _emog_is_stimulus_muse(fname: str) -> bool:
-    stem  = fname.replace(".json", "")
-    parts = stem.split("_")
-    if len(parts) < 4:
-        return False
-    return parts[2].upper() == "STIMULUS" and parts[3].upper() == "MUSE"
+    parts = fname.replace(".json", "").split("_")
+    return (len(parts) >= 4 and
+            parts[2].upper() == "STIMULUS" and
+            parts[3].upper() == "MUSE")
 
 
 def _emog_parse_emotion(fname: str) -> str:
@@ -240,10 +234,6 @@ def _emog_parse_subject(fname: str) -> str:
 
 
 def _emog_read_json(fpath: str) -> Optional[np.ndarray]:
-    """
-    Load one STIMULUS_MUSE JSON, quality-filter, return [4, T] float32 or None.
-    Channels: TP9, AF7, AF8, TP10.
-    """
     with open(fpath, "r") as f:
         data = json.load(f)
 
@@ -262,10 +252,8 @@ def _emog_read_json(fpath: str) -> Optional[np.ndarray]:
     hsi_tp10 = _emog_to_num(data.get("HSI_TP10", []))[:L]
     head_on  = _emog_to_num(data.get("HeadBandOn", []))[:L]
 
-    mask = (
-        np.isfinite(tp9[:L]) & np.isfinite(af7[:L]) &
-        np.isfinite(af8[:L]) & np.isfinite(tp10[:L])
-    )
+    mask = (np.isfinite(tp9[:L]) & np.isfinite(af7[:L]) &
+            np.isfinite(af8[:L]) & np.isfinite(tp10[:L]))
     if len(head_on) == L and len(hsi_tp9) == L:
         mask &= (
             (head_on == 1) &
@@ -275,21 +263,21 @@ def _emog_read_json(fpath: str) -> Optional[np.ndarray]:
             np.isfinite(hsi_tp10) & (hsi_tp10 <= 2)
         )
 
-    tp9  = tp9[:L][mask];  af7  = af7[:L][mask]
-    af8  = af8[:L][mask];  tp10 = tp10[:L][mask]
+    tp9 = tp9[:L][mask]; af7  = af7[:L][mask]
+    af8 = af8[:L][mask]; tp10 = tp10[:L][mask]
     if len(tp9) == 0:
         return None
 
-    signal = np.stack([tp9, af7, af8, tp10], axis=1).T.astype(np.float32)
+    signal  = np.stack([tp9, af7, af8, tp10], axis=1).T.astype(np.float32)
     signal -= signal.mean(axis=1, keepdims=True)
     return signal
 
 
 def get_emognition_subject_ids(cfg: WEAVEConfig) -> List[str]:
     patterns = [
-        os.path.join(cfg.data_path, "*",  "*.json"),
-        os.path.join(cfg.data_path,       "*.json"),
-        os.path.join(cfg.data_path, "*", "*", "*.json"),
+        os.path.join(cfg.data_path, "*",       "*.json"),
+        os.path.join(cfg.data_path,            "*.json"),
+        os.path.join(cfg.data_path, "*", "*",  "*.json"),
     ]
     files    = sorted({p for pat in patterns for p in glob.glob(pat)})
     subjects = set()
@@ -297,8 +285,7 @@ def get_emognition_subject_ids(cfg: WEAVEConfig) -> List[str]:
         fname = os.path.basename(fpath)
         if not _emog_is_stimulus_muse(fname):
             continue
-        emotion = _emog_parse_emotion(fname)
-        if emotion in cfg.emognition_class_map:
+        if _emog_parse_emotion(fname) in cfg.emognition_class_map:
             subjects.add(_emog_parse_subject(fname))
     return sorted(subjects)
 
@@ -317,8 +304,7 @@ def _emog_find_trials(subject_id: str, cfg: WEAVEConfig) -> List[Tuple[str, int]
             continue
         if not _emog_is_stimulus_muse(fname):
             continue
-        emotion = _emog_parse_emotion(fname)
-        label   = cfg.emognition_class_map.get(emotion)
+        label = cfg.emognition_class_map.get(_emog_parse_emotion(fname))
         if label is None:
             continue
         result.append((fpath, label))
@@ -328,48 +314,48 @@ def _emog_find_trials(subject_id: str, cfg: WEAVEConfig) -> List[Tuple[str, int]
 def load_emognition_subject(
     subject_id: str,
     cfg: WEAVEConfig,
-) -> Tuple[np.ndarray, np.ndarray]:
+    trial_id_offset: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Load all STIMULUS_MUSE trials for one Emognition subject.
 
     Returns:
-        segments : [N, 4, segment_samples]
-        labels   : [N]  int
+        segments  : [N, 4, segment_samples]
+        labels    : [N]   int
+        trial_ids : [N]   int  – one unique ID per JSON file (trial)
+                                 IDs start from trial_id_offset
     """
-    srate          = 256   # Emognition MUSE sampling rate
-    segment_samples = int(cfg.segment_duration * srate)
-    lead_in_samples = int(cfg.lead_in_duration  * srate)
+    srate            = 256
+    segment_samples  = int(cfg.segment_duration  * srate)
+    lead_in_samples  = int(cfg.lead_in_duration  * srate)
     baseline_samples = int(cfg.baseline_duration * srate)
-    segment_len     = srate    # 1-s baseline averaging segments
-
-    min_needed = lead_in_samples + baseline_samples + segment_samples
+    segment_len      = srate
+    min_needed       = lead_in_samples + baseline_samples + segment_samples
 
     trial_files = _emog_find_trials(subject_id, cfg)
     if not trial_files:
         logger.warning(f"Emognition: no trials found for subject '{subject_id}'")
-        return np.empty((0, 4, segment_samples), dtype=np.float32), \
-               np.empty((0,), dtype=np.int64)
+        empty = np.empty((0, 4, segment_samples), dtype=np.float32)
+        return empty, np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
 
-    all_segs, all_labels = [], []
-    skipped = 0
+    all_segs, all_labels, all_tids = [], [], []
+    skipped   = 0
+    local_tid = trial_id_offset   # increments once per valid JSON file
 
     for fpath, label in trial_files:
         fname  = os.path.basename(fpath)
         signal = _emog_read_json(fpath)
+
         if signal is None:
             logger.warning(f"  Skipping {fname}: empty after quality filter")
             skipped += 1
             continue
-
         if signal.shape[1] < min_needed:
-            logger.warning(
-                f"  Skipping {fname}: only {signal.shape[1]} samples "
-                f"(need ≥ {min_needed})"
-            )
+            logger.warning(f"  Skipping {fname}: only {signal.shape[1]} samples "
+                           f"(need ≥ {min_needed})")
             skipped += 1
             continue
 
-        # discard lead-in
         trimmed  = signal[:, lead_in_samples:]
         baseline = trimmed[:, :baseline_samples]
         stimulus = trimmed[:, baseline_samples:]
@@ -382,7 +368,7 @@ def load_emognition_subject(
             continue
 
         clean = _zscore_1d(clean)
-        segs  = _segment_signal(clean, segment_samples)  # [N_s, 4, T_seg]
+        segs  = _segment_signal(clean, segment_samples)
 
         if segs.shape[0] == 0:
             logger.warning(f"  Skipping {fname}: 0 segments produced")
@@ -390,65 +376,76 @@ def load_emognition_subject(
             continue
 
         all_segs.append(segs)
-        all_labels.extend([label] * segs.shape[0])
+        all_labels.extend([label]     * segs.shape[0])
+        all_tids.extend([local_tid]   * segs.shape[0])  # ← all windows of this file share one ID
+        local_tid += 1                                   # ← next file gets a new ID
 
-        logger.debug(
-            f"  Emognition {subject_id} | {fname} | "
-            f"label={label} | segments={segs.shape[0]}"
-        )
+        logger.debug(f"  {subject_id} | {fname} | tid={local_tid-1} | "
+                     f"label={label} | segs={segs.shape[0]}")
 
     if not all_segs:
-        return np.empty((0, 4, segment_samples), dtype=np.float32), \
-               np.empty((0,), dtype=np.int64)
+        empty = np.empty((0, 4, segment_samples), dtype=np.float32)
+        return empty, np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
 
-    segments = np.concatenate(all_segs, axis=0)
-    labels   = np.array(all_labels, dtype=np.int64)
+    segments  = np.concatenate(all_segs, axis=0)
+    labels    = np.array(all_labels, dtype=np.int64)
+    trial_ids = np.array(all_tids,   dtype=np.int64)
 
     logger.info(
-        f"Emognition subject {subject_id}: {segments.shape[0]} segments "
-        f"loaded, {skipped} skipped | "
+        f"Emognition subject {subject_id}: {segments.shape[0]} segments | "
+        f"{len(np.unique(trial_ids))} trials | {skipped} skipped | "
         f"class dist {np.bincount(labels, minlength=cfg.n_classes).tolist()}"
     )
-    return segments, labels
+    return segments, labels, trial_ids
 
 
 def load_emognition_all_subjects(
     cfg: WEAVEConfig,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Pool all Emognition subjects into one segment matrix."""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pool all Emognition subjects. trial_ids are globally unique."""
     ids = get_emognition_subject_ids(cfg)
-    all_segs, all_labels = [], []
+    all_segs, all_labels, all_tids = [], [], []
+    tid_offset = 0
     for sid in ids:
-        segs, labels = load_emognition_subject(sid, cfg)
+        segs, labels, tids = load_emognition_subject(
+            sid, cfg, trial_id_offset=tid_offset
+        )
         if segs.shape[0]:
             all_segs.append(segs)
             all_labels.append(labels)
+            all_tids.append(tids)
+            tid_offset = int(tids.max()) + 1   # next subject's trials start after this
     if not all_segs:
         raise RuntimeError("No Emognition segments loaded — check data_path.")
-    return np.concatenate(all_segs, axis=0), np.concatenate(all_labels, axis=0)
+    return (np.concatenate(all_segs,   axis=0),
+            np.concatenate(all_labels, axis=0),
+            np.concatenate(all_tids,   axis=0))
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  UNIFIED API
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def load_data(
     cfg: WEAVEConfig,
     subject_id=None,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load segments and labels for the configured dataset.
+    Load segments, labels, and trial_ids for the configured dataset.
 
     Args:
         cfg        : WEAVEConfig
         subject_id : int (DEAP) | str (Emognition) | None → all subjects
 
     Returns:
-        segments : [N, C, T]
-        labels   : [N]
+        segments  : [N, C, T]
+        labels    : [N]   – integer class label per window
+        trial_ids : [N]   – integer trial ID per window (globally unique)
+                            All windows from the same recording file share
+                            the same trial ID.  Use this to split at the
+                            trial level and avoid within-trial leakage.
     """
     is_emog = cfg.dataset.lower() == "emognition"
-
     if subject_id is not None:
         if is_emog:
             return load_emognition_subject(str(subject_id), cfg)
