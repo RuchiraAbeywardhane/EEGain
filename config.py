@@ -93,12 +93,12 @@ class EEGNetConfig:
 
 @dataclass
 class TSceptionConfig:
-    num_classes: int = 2
-    sampling_r: int = 128
-    num_t: int = 9       # reduced from 15 — fewer temporal filters for 4-channel data
-    num_s: int = 6       # reduced from 15 — only 4 spatial sources, 6 filters is enough
+    num_classes: int = 4             # 4 emotions for Emognition (override to 2 for DEAP)
+    sampling_r: int = 256            # 256 Hz for Emognition (override to 128 for DEAP)
+    num_t: int = 9                   # temporal filters
+    num_s: int = 6                   # spatial filters — only 4 channels, 6 is enough
     hidden: int = 32
-    dropout_rate: float = 0.5
+    dropout_rate: float = 0.3        # reduced: less aggressive for 4-channel dataset
 
 @dataclass
 class  DeepConvNetConfig:
