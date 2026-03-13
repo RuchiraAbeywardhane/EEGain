@@ -433,10 +433,12 @@ def loso_loop(model, loader, logger, **kwargs):
             lr=kwargs["lr"],
             weight_decay=kwargs["weight_decay"]
         )
-        # ReduceLROnPlateau: halves LR when val loss stops improving
-        # more effective than CosineAnnealing for early stopping scenarios
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=3
+        # CosineAnnealingLR: smooth decay over the full training budget.
+        # ReduceLROnPlateau with patience=3 was halving the LR every 3 epochs
+        # (1e-3 → 1.25e-4 by epoch 9), permanently stalling learning before
+        # the model could find a generalisable minimum.
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=kwargs.get("num_epochs", 100), eta_min=1e-5
         )
         is_random = False
     class_weights = compute_class_weights(loader["train"], kwargs["num_classes"])

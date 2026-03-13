@@ -75,11 +75,11 @@ class EmognitionConfig:
 @dataclass
 class TrainingConfig:
     batch_size: int = 32
-    lr: float = 1e-4
-    weight_decay: float = 0.05        # increased: AdamW decouples it correctly now
-    label_smoothing: float = 0.1      # increased: stronger regularisation
-    num_epochs: int = 100             # high ceiling — early stopping will cut it
-    early_stopping_patience: int = 15  # raised from 7: cross-subject val loss oscillates heavily
+    lr: float = 1e-3                  # raised: 1e-4 was too slow to escape the entropy ceiling
+    weight_decay: float = 0.01        # lowered: 0.05 was over-regularising a tiny model
+    label_smoothing: float = 0.05     # lowered: 0.1 pushes logits toward uniform → reinforces flat loss
+    num_epochs: int = 100
+    early_stopping_patience: int = 15
     log_dir: str = "logs/"
     overal_log_file: str = "logs.txt"
 
