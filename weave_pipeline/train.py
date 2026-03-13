@@ -21,7 +21,11 @@ from typing import Dict, List, Tuple
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedShuffleSplit
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import (
+    accuracy_score, f1_score,
+    precision_score, recall_score,
+    confusion_matrix,
+)
 
 from .config import WEAVEConfig
 from .features import extract_weave_features
@@ -46,6 +50,52 @@ def _make_svm(cfg: WEAVEConfig) -> SVC:
         random_state = None,               # SVC doesn't use random_state for RBF
         max_iter     = -1,                 # no iteration cap
     )
+
+
+# ── Per-class metrics helper ──────────────────────────────────────────────────
+
+def _per_class_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    n_classes: int,
+) -> Dict:
+    """
+    Return per-class accuracy, precision, recall, and F1.
+
+    Per-class accuracy = (TP + TN) / N  for each class treated as binary
+                       = diagonal of the normalised confusion matrix when
+                         expressed as the fraction of true-class samples
+                         correctly predicted (recall per class).
+
+    We use sklearn's 'macro' with labels= to get one value per class.
+
+    Returns a dict:
+        {
+          "class_acc"      : [n_classes]  – recall per class (= class-wise accuracy)
+          "class_precision": [n_classes]
+          "class_recall"   : [n_classes]  – same as class_acc
+          "class_f1"       : [n_classes]
+          "confusion"      : [n_classes, n_classes]  – raw counts
+        }
+    """
+    labels = list(range(n_classes))
+
+    precision = precision_score(y_true, y_pred, labels=labels,
+                                average=None, zero_division=0)
+    recall    = recall_score(   y_true, y_pred, labels=labels,
+                                average=None, zero_division=0)
+    f1        = f1_score(       y_true, y_pred, labels=labels,
+                                average=None, zero_division=0)
+    cm        = confusion_matrix(y_true, y_pred, labels=labels)
+
+    # Per-class accuracy = recall (proportion of class-i samples predicted correctly)
+    return {
+        "class_acc"      : recall.tolist(),      # recall == class-wise accuracy
+        "class_precision": precision.tolist(),
+        "class_recall"   : recall.tolist(),
+        "class_f1"       : f1.tolist(),
+        "confusion"      : cm.tolist(),
+    }
 
 
 # ── Single repetition ────────────────────────────────────────────────────────
@@ -94,6 +144,7 @@ def _run_one_rep(
     full_acc      = accuracy_score(y_test, pred_full)
     full_f1       = f1_score(y_test, pred_full,
                              average="weighted", zero_division=0)
+    full_pc       = _per_class_metrics(y_test, pred_full, cfg.n_classes)
 
     # ── Run 2: NMI channel reduction (train set only) ─────────────────────
     (X_tr_red, X_te_red,
@@ -113,12 +164,15 @@ def _run_one_rep(
     reduced_acc   = accuracy_score(y_test, pred_red)
     reduced_f1    = f1_score(y_test, pred_red,
                              average="weighted", zero_division=0)
+    red_pc        = _per_class_metrics(y_test, pred_red, cfg.n_classes)
 
     return {
         "full_acc":        full_acc,
         "full_f1":         full_f1,
+        "full_per_class":  full_pc,
         "reduced_acc":     reduced_acc,
         "reduced_f1":      reduced_f1,
+        "red_per_class":   red_pc,
         "ranked_channels": ranked_indices.tolist(),
         "kept_channels":   keep_k,
     }
@@ -195,6 +249,35 @@ def _summarise(rep_results: List[Dict], cfg: WEAVEConfig) -> Dict:
     avg_rank_pos /= len(rep_results)
     consensus_ranking = np.argsort(avg_rank_pos).tolist()
 
+    # Aggregate per-class metrics across repetitions
+    def _agg_pc(key_outer, key_inner):
+        mat = np.array([r[key_outer][key_inner] for r in rep_results])  # [R, C]
+        return {
+            "mean": mat.mean(axis=0).tolist(),   # [C]
+            "std":  mat.std(axis=0).tolist(),    # [C]
+        }
+
+    full_pc = {
+        "acc"      : _agg_pc("full_per_class", "class_acc"),
+        "precision": _agg_pc("full_per_class", "class_precision"),
+        "recall"   : _agg_pc("full_per_class", "class_recall"),
+        "f1"       : _agg_pc("full_per_class", "class_f1"),
+    }
+    red_pc = {
+        "acc"      : _agg_pc("red_per_class", "class_acc"),
+        "precision": _agg_pc("red_per_class", "class_precision"),
+        "recall"   : _agg_pc("red_per_class", "class_recall"),
+        "f1"       : _agg_pc("red_per_class", "class_f1"),
+    }
+
+    # Aggregate confusion matrices
+    full_cm_mean = np.mean(
+        [r["full_per_class"]["confusion"] for r in rep_results], axis=0
+    )
+    red_cm_mean  = np.mean(
+        [r["red_per_class"]["confusion"]  for r in rep_results], axis=0
+    )
+
     summary = {
         "rep_results":        rep_results,
         # Full-channel results
@@ -207,6 +290,11 @@ def _summarise(rep_results: List[Dict], cfg: WEAVEConfig) -> Dict:
         "reduced_std_acc":    float(np.std(red_accs)),
         "reduced_mean_f1":    float(np.mean(red_f1s)),
         "reduced_std_f1":     float(np.std(red_f1s)),
+        # Per-class metrics
+        "full_per_class":     full_pc,
+        "red_per_class":      red_pc,
+        "full_cm_mean":       full_cm_mean.tolist(),
+        "red_cm_mean":        red_cm_mean.tolist(),
         "kept_channels":      rep_results[0]["kept_channels"],
         "total_channels":     n_ch,
         "consensus_ranking":  consensus_ranking,
@@ -221,13 +309,49 @@ def _summarise(rep_results: List[Dict], cfg: WEAVEConfig) -> Dict:
           f"{2 * len(cfg.retained_bands)} feat/ch  |  "
           f"{2 * len(cfg.retained_bands) * cfg.n_eeg_channels} total feat")
     print(f"{'─'*65}")
-    print(f"  Full channels ({cfg.n_eeg_channels} ch)")
+
+    # ── Overall ───────────────────────────────────────────────────────────
+    print(f"\n  Overall — Full channels ({cfg.n_eeg_channels} ch)")
     print(f"    Accuracy : {summary['full_mean_acc']:.4f} ± {summary['full_std_acc']:.4f}")
     print(f"    F1-score : {summary['full_mean_f1']:.4f} ± {summary['full_std_f1']:.4f}")
-    print(f"  Reduced channels ({summary['kept_channels']} ch)")
+    print(f"\n  Overall — Reduced channels ({summary['kept_channels']} ch)")
     print(f"    Accuracy : {summary['reduced_mean_acc']:.4f} ± {summary['reduced_std_acc']:.4f}")
     print(f"    F1-score : {summary['reduced_mean_f1']:.4f} ± {summary['reduced_std_f1']:.4f}")
-    print(f"{'='*65}\n")
+
+    # ── Per-class table printer ───────────────────────────────────────────
+    cnames = cfg.class_names
+
+    def _print_pc_table(pc_dict, header):
+        print(f"\n  {header}")
+        print(f"  {'Class':<14}  {'Accuracy':>12}  {'Precision':>10}  "
+              f"{'Recall':>8}  {'F1':>8}")
+        print(f"  {'─'*60}")
+        for i, name in enumerate(cnames):
+            print(
+                f"  {name:<14}  "
+                f"{pc_dict['acc']['mean'][i]:.4f}±{pc_dict['acc']['std'][i]:.3f}  "
+                f"{pc_dict['precision']['mean'][i]:.4f}±{pc_dict['precision']['std'][i]:.3f}  "
+                f"{pc_dict['recall']['mean'][i]:.4f}±{pc_dict['recall']['std'][i]:.3f}  "
+                f"{pc_dict['f1']['mean'][i]:.4f}±{pc_dict['f1']['std'][i]:.3f}"
+            )
+
+    _print_pc_table(full_pc, f"Per-Class — Full channels ({cfg.n_eeg_channels} ch)")
+    _print_pc_table(red_pc,  f"Per-Class — Reduced channels ({summary['kept_channels']} ch)")
+
+    # ── Confusion matrices ────────────────────────────────────────────────
+    def _print_cm(cm, title):
+        print(f"\n  {title}  (mean over {cfg.n_repetitions} reps)")
+        print("  " + " " * 14 + "".join(f"  {n[:8]:>8}" for n in cnames))
+        for i, name in enumerate(cnames):
+            row = "  " + f"{name:<14}" + "".join(
+                f"  {cm[i][j]:8.1f}" for j in range(cfg.n_classes)
+            )
+            print(row)
+
+    _print_cm(full_cm_mean, f"Confusion Matrix — Full ({cfg.n_eeg_channels} ch)")
+    _print_cm(red_cm_mean,  f"Confusion Matrix — Reduced ({summary['kept_channels']} ch)")
+
+    print(f"\n{'='*65}\n")
 
     return summary
 
@@ -242,10 +366,13 @@ def save_results(summary: Dict, log_path: str, cfg: WEAVEConfig):
     n_feat_per_ch   = 2 * len(cfg.retained_bands)
     total_feat_full = cfg.n_eeg_channels * n_feat_per_ch
     total_feat_red  = summary["kept_channels"] * n_feat_per_ch
+    cnames          = cfg.class_names
+    n_classes       = cfg.n_classes
 
     with open(log_path, "w") as f:
+        # ── Header ───────────────────────────────────────────────────────
         f.write("WEAVE + SVM Pipeline Results\n")
-        f.write("=" * 50 + "\n")
+        f.write("=" * 60 + "\n")
         f.write(f"Dataset         : {cfg.dataset.upper()}\n")
         if cfg.dataset.lower() == "deap":
             f.write(f"Label type      : {cfg.label_type} "
@@ -255,27 +382,28 @@ def save_results(summary: Dict, log_path: str, cfg: WEAVEConfig):
         f.write(f"Wavelet         : {cfg.wavelet}\n")
         f.write(f"Retained bands  : {cfg.retained_bands}\n")
         f.write(f"Segment duration: {cfg.segment_duration} s\n")
-        f.write(f"Channels        : {cfg.n_eeg_channels}  →  {summary['kept_channels']} "
-                f"(after NMI reduction)\n")
+        f.write(f"Channels        : {cfg.n_eeg_channels}  →  "
+                f"{summary['kept_channels']} (after NMI reduction)\n")
         f.write(f"Features        : {total_feat_full} full  →  {total_feat_red} reduced\n")
         f.write(f"Repetitions     : {cfg.n_repetitions}\n")
-        f.write("=" * 50 + "\n\n")
+        f.write("=" * 60 + "\n\n")
 
+        # ── Per-repetition table ──────────────────────────────────────────
         f.write("Per-Repetition Results\n")
-        f.write("-" * 50 + "\n")
+        f.write("-" * 60 + "\n")
         f.write(f"{'Rep':>4}  {'Full Acc':>9}  {'Full F1':>8}  "
                 f"{'Red Acc':>8}  {'Red F1':>7}\n")
-        f.write("-" * 50 + "\n")
-        for r in summary["rep_results"]:
-            idx = summary["rep_results"].index(r) + 1
+        f.write("-" * 60 + "\n")
+        for idx, r in enumerate(summary["rep_results"], 1):
             f.write(
                 f"{idx:4d}  {r['full_acc']:9.4f}  {r['full_f1']:8.4f}  "
                 f"{r['reduced_acc']:8.4f}  {r['reduced_f1']:7.4f}\n"
             )
-        f.write("-" * 50 + "\n\n")
+        f.write("-" * 60 + "\n\n")
 
-        f.write("Summary\n")
-        f.write("-" * 50 + "\n")
+        # ── Overall summary ───────────────────────────────────────────────
+        f.write("Overall Summary\n")
+        f.write("-" * 60 + "\n")
         f.write(f"Full channels ({cfg.n_eeg_channels} ch, {total_feat_full} feat)\n")
         f.write(f"  Accuracy : {summary['full_mean_acc']:.4f} ± {summary['full_std_acc']:.4f}\n")
         f.write(f"  F1-score : {summary['full_mean_f1']:.4f} ± {summary['full_std_f1']:.4f}\n\n")
@@ -283,7 +411,56 @@ def save_results(summary: Dict, log_path: str, cfg: WEAVEConfig):
         f.write(f"  Accuracy : {summary['reduced_mean_acc']:.4f} ± {summary['reduced_std_acc']:.4f}\n")
         f.write(f"  F1-score : {summary['reduced_mean_f1']:.4f} ± {summary['reduced_std_f1']:.4f}\n\n")
 
-        f.write(f"Consensus NMI channel ranking (best → worst):\n")
+        # ── Per-class tables ──────────────────────────────────────────────
+        def _write_pc_table(pc_dict, title):
+            f.write(f"{title}\n")
+            f.write("-" * 60 + "\n")
+            f.write(f"{'Class':<14}  {'Accuracy':>12}  {'Precision':>12}  "
+                    f"{'Recall':>12}  {'F1':>12}\n")
+            f.write("-" * 60 + "\n")
+            for i, name in enumerate(cnames):
+                f.write(
+                    f"{name:<14}  "
+                    f"{pc_dict['acc']['mean'][i]:.4f}±{pc_dict['acc']['std'][i]:.3f}  "
+                    f"{pc_dict['precision']['mean'][i]:.4f}±{pc_dict['precision']['std'][i]:.3f}  "
+                    f"{pc_dict['recall']['mean'][i]:.4f}±{pc_dict['recall']['std'][i]:.3f}  "
+                    f"{pc_dict['f1']['mean'][i]:.4f}±{pc_dict['f1']['std'][i]:.3f}\n"
+                )
+            f.write("\n")
+
+        _write_pc_table(
+            summary["full_per_class"],
+            f"Per-Class Metrics — Full channels ({cfg.n_eeg_channels} ch)"
+        )
+        _write_pc_table(
+            summary["red_per_class"],
+            f"Per-Class Metrics — Reduced channels ({summary['kept_channels']} ch)"
+        )
+
+        # ── Confusion matrices ────────────────────────────────────────────
+        def _write_cm(cm, title):
+            f.write(f"{title}  (mean over {cfg.n_repetitions} reps)\n")
+            f.write("-" * 60 + "\n")
+            f.write(f"{'':14}" + "".join(f"  {n[:10]:>10}" for n in cnames) + "\n")
+            for i, name in enumerate(cnames):
+                f.write(
+                    f"{name:<14}"
+                    + "".join(f"  {cm[i][j]:10.1f}" for j in range(n_classes))
+                    + "\n"
+                )
+            f.write("\n")
+
+        _write_cm(
+            summary["full_cm_mean"],
+            f"Confusion Matrix — Full channels ({cfg.n_eeg_channels} ch)"
+        )
+        _write_cm(
+            summary["red_cm_mean"],
+            f"Confusion Matrix — Reduced channels ({summary['kept_channels']} ch)"
+        )
+
+        # ── Consensus channel ranking ─────────────────────────────────────
+        f.write("Consensus NMI channel ranking (best → worst):\n")
         f.write(f"  {summary['consensus_ranking']}\n")
 
     logger.info(f"Results saved → {log_path}")
