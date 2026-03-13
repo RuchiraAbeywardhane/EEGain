@@ -79,7 +79,7 @@ class TrainingConfig:
     weight_decay: float = 0.05        # increased: AdamW decouples it correctly now
     label_smoothing: float = 0.1      # increased: stronger regularisation
     num_epochs: int = 100             # high ceiling — early stopping will cut it
-    early_stopping_patience: int = 7  # stop after 7 epochs of no val_loss improvement
+    early_stopping_patience: int = 15  # raised from 7: cross-subject val loss oscillates heavily
     log_dir: str = "logs/"
     overal_log_file: str = "logs.txt"
 
@@ -96,9 +96,9 @@ class TSceptionConfig:
     num_classes: int = 4             # 4 emotions for Emognition (override to 2 for DEAP)
     sampling_r: int = 256            # 256 Hz for Emognition (override to 128 for DEAP)
     num_t: int = 9                   # temporal filters
-    num_s: int = 6                   # spatial filters — only 4 channels, 6 is enough
-    hidden: int = 32
-    dropout_rate: float = 0.3        # reduced: less aggressive for 4-channel dataset
+    num_s: int = 6                   # spatial filters
+    hidden: int = 32                 # FC hidden size (num_s -> hidden -> num_classes)
+    dropout_rate: float = 0.3
 
 @dataclass
 class  DeepConvNetConfig:

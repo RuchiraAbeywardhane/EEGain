@@ -94,11 +94,14 @@ class TSception(nn.Module):
         self.BN_s = nn.BatchNorm2d(num_s)
         self.BN_fusion = nn.BatchNorm2d(num_s)
 
-        # [FIX] Simpler classifier — single linear layer with softmax
-        # Prevents overfitting when spatial features are sparse (low channel count)
+        # Proper 2-layer classifier: num_s -> hidden -> num_classes
+        # NO Softmax: nn.CrossEntropyLoss applies log-softmax internally.
+        # Having Softmax here feeds log(softmax(x)) into the loss, corrupting gradients.
         self.fc = nn.Sequential(
-            nn.Linear(num_s, num_classes),
-            nn.Softmax(dim=1),
+            nn.Linear(num_s, hidden),
+            nn.GELU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(hidden, num_classes),
         )
 
     def forward(self, x):

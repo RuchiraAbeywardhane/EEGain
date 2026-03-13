@@ -20,7 +20,7 @@ python run_cli.py ^
   --hidden=32 ^
   --dropout_rate=0.3 ^
   --num_epochs=100 ^
-  --early_stopping_patience=7 ^
+  --early_stopping_patience=15 ^
   --batch_size=32 ^
   --lr=1e-4 ^
   --weight_decay=0.05 ^

@@ -120,6 +120,15 @@ def generate_options():
         # Generate CLI options for all config values from all configs
         all_configs = other_configs + dataset_configs
         
+        # Fields that are already declared as explicit @click.option above main().
+        # Exclude them here to prevent "parameter used more than once" warnings.
+        EXPLICIT_CLI_OPTIONS = {
+            "split_type", "use_baseline_reduction", "early_stopping_patience",
+            "log_predictions", "log_predictions_dir", "train_val_split",
+            "random_seed", "train_subjects", "test_subjects", "window_scales",
+            "svm_kernel", "svm_c", "svm_features",
+        }
+
         # Track all fields we've seen to handle duplicates
         seen_fields = set()
         
@@ -127,7 +136,7 @@ def generate_options():
         for config_class in all_configs:
             config_instance = config_class()
             for field, value in asdict(config_instance).items():
-                if field not in seen_fields:
+                if field not in seen_fields and field not in EXPLICIT_CLI_OPTIONS:
                     seen_fields.add(field)
                     option = click.option(f"--{field}", default=value, required=False, type=type(value))
                     func = option(func)
