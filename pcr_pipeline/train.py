@@ -211,15 +211,29 @@ def run_10fold_cv(
     """
     Stratified K-fold CV splitting at the TRIAL level.
 
-    n_folds is automatically capped to n_trials so it never exceeds the
-    number of samples.  For Emognition with 4 trials this becomes
-    Leave-One-Out (4 folds).
+    Windows are only expanded AFTER the split — no window from a trial
+    ever appears in both train and test (no leakage).
+
+    For Emognition, always run with --all_subjects so there are enough
+    trials per class for a meaningful split (43 subjects × 4 trials = 172).
+    Running on a single Emognition subject gives only 4 trials (1 per class)
+    which is not enough for cross-validation.
     """
     trial_labels_np = np.array(trial_labels)
-    n_trials = len(trial_labels)
-    trial_idx_all = np.arange(n_trials)
+    n_trials        = len(trial_labels)
+    n_classes       = len(set(trial_labels))
+    trials_per_class = n_trials / max(n_classes, 1)
 
-    # ── Cap folds to number of trials ────────────────────────────────────────
+    # ── Warn if too few trials for meaningful CV ──────────────────────────────
+    if trials_per_class < 2:
+        logger.warning(
+            f"Only {n_trials} trials for {n_classes} classes "
+            f"({trials_per_class:.1f} trials/class). "
+            f"Results will not be meaningful. "
+            f"For Emognition, use --all_subjects to pool all subjects "
+            f"(43 subjects × 4 trials = 172 trials)."
+        )
+
     n_folds = min(cfg.n_folds, n_trials)
     if n_folds < cfg.n_folds:
         logger.warning(
@@ -227,49 +241,48 @@ def run_10fold_cv(
             f"(only {n_trials} trials available)"
         )
 
-    # With very few trials, stratified split may fail if some classes have
-    # only 1 sample — fall back to plain KFold in that case.
     try:
         skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=cfg.seed)
-        splits = list(skf.split(trial_idx_all, trial_labels_np))
+        splits = list(skf.split(np.arange(n_trials), trial_labels_np))
     except ValueError:
         from sklearn.model_selection import KFold
         logger.warning("StratifiedKFold failed — falling back to plain KFold")
         kf = KFold(n_splits=n_folds, shuffle=True, random_state=cfg.seed)
-        splits = list(kf.split(trial_idx_all))
+        splits = list(kf.split(np.arange(n_trials)))
 
     fold_results = []
-
     for fold_idx, (train_val_trial_idx, test_trial_idx) in enumerate(splits):
         print(f"\n{'='*60}")
         print(f"  FOLD {fold_idx + 1} / {n_folds}  "
-              f"(train+val trials={len(train_val_trial_idx)}, test trials={len(test_trial_idx)})")
+              f"(train+val trials={len(train_val_trial_idx)}, "
+              f"test trials={len(test_trial_idx)})")
         print(f"{'='*60}")
 
-        # ── Trial-level train / val split (80/20, class-balanced where possible)
+        # ── Trial-level 80/20 train/val split, class-balanced ─────────────
         tv_labels = trial_labels_np[train_val_trial_idx]
         train_rel, val_rel = [], []
         rng = np.random.default_rng(cfg.seed + fold_idx)
-
-        if len(train_val_trial_idx) < 2:
-            # Only 1 train+val trial — use it for both train and val
-            train_rel = list(range(len(train_val_trial_idx)))
-            val_rel   = list(range(len(train_val_trial_idx)))
-        else:
-            for cls in np.unique(tv_labels):
-                cls_mask = np.where(tv_labels == cls)[0]
-                rng.shuffle(cls_mask)
-                split = max(1, int(len(cls_mask) * 0.8))
-                train_rel.extend(cls_mask[:split].tolist())
-                val_rel.extend(cls_mask[split:].tolist())
-            # Ensure val is never empty
-            if not val_rel:
-                val_rel = train_rel[-1:]
+        for cls in np.unique(tv_labels):
+            cls_mask = np.where(tv_labels == cls)[0]
+            rng.shuffle(cls_mask)
+            split = max(1, int(len(cls_mask) * 0.8))
+            train_rel.extend(cls_mask[:split].tolist())
+            val_rel.extend(cls_mask[split:].tolist())
+        if not val_rel:
+            val_rel = train_rel[-1:]
 
         train_trial_idx = train_val_trial_idx[train_rel]
         val_trial_idx   = train_val_trial_idx[val_rel]
 
-        # ── Expand trials → windows AFTER the split ───────────────────────
+        # Log class distribution per split
+        for split_name, split_idx in [("train", train_trial_idx),
+                                       ("val",   val_trial_idx),
+                                       ("test",  test_trial_idx)]:
+            u, c = np.unique(trial_labels_np[split_idx], return_counts=True)
+            logger.info(f"  Fold {fold_idx+1} {split_name} trials: "
+                        f"{ {int(k): int(v) for k, v in zip(u, c)} }")
+
+        # ── Expand trials → windows AFTER the split (no leakage) ─────────
         def trials_to_dataset(idx_list):
             x2 = np.concatenate([trials_2d[i] for i in idx_list], axis=0)
             x1 = np.concatenate([trials_1d[i] for i in idx_list], axis=0)
@@ -286,7 +299,10 @@ def run_10fold_cv(
         result = train_fold(train_ds, val_ds, test_ds, cfg, fold_idx)
         fold_results.append(result)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    return _summarise(fold_results, n_folds)
+
+
+def _summarise(fold_results: List[Dict], n_folds: int) -> Dict:
     accs = [r["test_acc"] for r in fold_results]
     f1s  = [r["test_f1"]  for r in fold_results]
 
