@@ -59,7 +59,7 @@ class PCRConfig:
 
     # ── Windowing ─────────────────────────────────────────────────────────────
     window_size: int = 128              # samples per window  (1 s @ 128 Hz)
-    window_step: int = 128             # stride between windows (128 = no overlap)
+    window_step: int = 64               # stride — 64 = 50% overlap (DEAP: 0.5s, Emognition: 0.25s)
 
     # ── CNN branch ────────────────────────────────────────────────────────────
     cnn_filters: List[int] = field(default_factory=lambda: [32, 64, 128])
@@ -67,11 +67,11 @@ class PCRConfig:
     cnn_reduce_filters: int = 13        # 1×1 fusion filters (2D path only)
 
     # ── LSTM branch ───────────────────────────────────────────────────────────
-    lstm_hidden: int = 32
+    lstm_hidden: int = 64               # increased from 32 — more capacity for 4-class
     lstm_layers: int = 2
 
     # ── Joint classifier ──────────────────────────────────────────────────────
-    dropout: float = 0.5
+    dropout: float = 0.3                # reduced from 0.5 — less aggressive for small dataset
 
     # ── Training ─────────────────────────────────────────────────────────────
     n_folds: int = 10

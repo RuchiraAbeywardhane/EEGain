@@ -111,13 +111,19 @@ def _make_config(args) -> PCRConfig:
         cfg.n_eeg_channels = 4
         cfg.n_classes      = 4
         cfg.class_names    = ["enthusiasm", "neutral", "fear", "sadness"]
-        cfg.window_size    = 128   # will be scaled ×2 inside loader/model (→256 samples)
-        cfg.window_step    = 128
+        cfg.window_size    = 128          # scaled ×2 inside model → 256 samples = 1s @ 256Hz
+        cfg.window_step    = 64           # 50% overlap → ~4× more windows per trial
+        cfg.lstm_hidden    = 64           # more capacity for 4-class problem
+        cfg.dropout        = 0.3          # less aggressive — dataset is small
     else:
         cfg.sampling_rate  = 128
         cfg.n_eeg_channels = 32
         cfg.n_classes      = 2
         cfg.class_names    = ["low", "high"]
+        cfg.window_size    = 128
+        cfg.window_step    = 128          # DEAP: no overlap (original behaviour)
+        cfg.lstm_hidden    = 32
+        cfg.dropout        = 0.5
 
     return cfg
 
