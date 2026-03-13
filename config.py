@@ -75,9 +75,9 @@ class EmognitionConfig:
 @dataclass
 class TrainingConfig:
     batch_size: int = 32
-    lr: float = 1e-3                  # raised: 1e-4 was too slow to escape the entropy ceiling
-    weight_decay: float = 0.01        # lowered: 0.05 was over-regularising a tiny model
-    label_smoothing: float = 0.05     # lowered: 0.1 pushes logits toward uniform → reinforces flat loss
+    lr: float = 3e-4                  # lowered from 1e-3: avoids sharp, non-generalisable minima
+    weight_decay: float = 0.01
+    label_smoothing: float = 0.05
     num_epochs: int = 100
     early_stopping_patience: int = 15
     log_dir: str = "logs/"
@@ -93,12 +93,12 @@ class EEGNetConfig:
 
 @dataclass
 class TSceptionConfig:
-    num_classes: int = 4             # 4 emotions for Emognition (override to 2 for DEAP)
-    sampling_r: int = 256            # 256 Hz for Emognition (override to 128 for DEAP)
-    num_t: int = 9                   # temporal filters
-    num_s: int = 6                   # spatial filters
-    hidden: int = 32                 # FC hidden size (num_s -> hidden -> num_classes)
-    dropout_rate: float = 0.3
+    num_classes: int = 4
+    sampling_r: int = 256
+    num_t: int = 9
+    num_s: int = 6
+    hidden: int = 32
+    dropout_rate: float = 0.5        # raised from 0.3: train/val gap was 0.97 nats (severe overfit)
 
 @dataclass
 class  DeepConvNetConfig:

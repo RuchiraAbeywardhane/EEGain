@@ -33,8 +33,12 @@ def setup_seed(seed):
 
 def compute_class_weights(train_dataloader, num_classes):
     """
-    Compute inverse-frequency class weights from the training dataloader.
-    Returns a normalized weight tensor on the correct device.
+    Compute class weights using sklearn convention: n_samples / (n_classes * count_per_class).
+    This gives weights near 1.0 for balanced classes and >1.0 for minority classes,
+    so the loss gradient is actually amplified for under-represented classes.
+
+    The previous implementation normalized weights to sum=1, which made each weight
+    ~0.25 for 4 balanced classes — effectively no weighting at all.
     """
     all_labels = train_dataloader.dataset.y
     if isinstance(all_labels, torch.Tensor):
@@ -42,11 +46,11 @@ def compute_class_weights(train_dataloader, num_classes):
     else:
         all_labels = torch.tensor(all_labels).long()
 
+    n_samples = len(all_labels)
     counts = torch.bincount(all_labels, minlength=num_classes).float()
-    # avoid division by zero for classes with no samples
     counts = counts.clamp(min=1)
-    weights = 1.0 / counts
-    weights = weights / weights.sum()
+    # sklearn: weight_c = n_samples / (n_classes * count_c)
+    weights = n_samples / (num_classes * counts)
     return weights.to(device)
     
 def test_one_epoch(model, loader, loss_fn, val=False):
@@ -291,7 +295,9 @@ def run_loso(
                     print(f"  ✗ Early stopping triggered at epoch {i+1}")
                     break
 
-            scheduler.step(val_loss)
+            # CosineAnnealingLR.step() takes NO arguments — passing val_loss
+            # silently treats it as the epoch number, breaking the schedule.
+            scheduler.step()
             logger.log(test_subject_ids[0], train_pred, train_actual, i, "train", train_loss)
         else:
             test_pred, test_actual, test_loss = test_one_epoch_random(
