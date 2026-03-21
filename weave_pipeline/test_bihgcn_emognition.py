@@ -198,6 +198,10 @@ class ChannelCNNEncoder(nn.Module):
     Shared CNN applied independently to each channel's spectrogram.
     Input  : (batch × C, 1, freq_bins, time_frames)
     Output : (batch × C, embed_dim)
+
+    MaxPool is applied along the frequency axis only (kernel (2,1)) so that
+    the time dimension – which can be as small as 3 frames with 512-sample
+    segments – is never down-sampled and never collapses to 0.
     """
     def __init__(self, freq_bins: int, time_frames: int,
                  embed_dim: int = CNN_EMBED_DIM):
@@ -207,22 +211,22 @@ class ChannelCNNEncoder(nn.Module):
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.BatchNorm2d(32),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(kernel_size=(2, 1)),   # freq: /2,  time: unchanged
             # Block 2
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.BatchNorm2d(64),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(kernel_size=(2, 1)),   # freq: /4 total, time: unchanged
             # Block 3
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.BatchNorm2d(128),
-            nn.AdaptiveAvgPool2d((1, 1)),   # global average pool
+            nn.AdaptiveAvgPool2d((1, 1)),        # global average → (128, 1, 1)
         )
         self.fc = nn.Linear(128, embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B*C, 1, F, T)
+        # x: (B*C, 1, freq_bins, time_frames)
         h = self.cnn(x).flatten(1)   # (B*C, 128)
         return self.fc(h)             # (B*C, embed_dim)
 
