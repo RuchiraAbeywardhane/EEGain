@@ -43,7 +43,7 @@ class EEGDataset(ABC):
     @abstractmethod
     def __get_subject_ids__(self) -> List[int]:
         raise NotImplementedError
-
+    
     @abstractmethod
     def __get_subject__(
         self, subject_index: int
