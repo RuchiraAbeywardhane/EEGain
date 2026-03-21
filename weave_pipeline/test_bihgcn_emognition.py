@@ -3,23 +3,22 @@ test_bihgcn_emognition.py
 ─────────────────────────
 Standalone test script for the BIH-GCN EEG pipeline on the Emognition dataset.
 
-5-class emotion recognition:
+4-class emotion recognition:
     0 = enthusiasm
     1 = neutral
     2 = fear
     3 = sadness
-    4 = amusement
 
 Pipeline:
   1. Load raw EEG  → shape (N, 4, samples)
-  2. Bandpass 1–50 Hz + 50 Hz notch + per-channel z-score normalisation
-  3. Segment into 4-second windows (512 samples @ 128 Hz)
+  2. Re-window to 512 samples (4 s @ 128 Hz) if loader returns longer segments
+  3. Bandpass 1–50 Hz + 50 Hz notch + per-channel z-score normalisation
   4. STFT spectrogram → (batch, 4, freq_bins, time_frames)
   5. CNN encoder     → (batch, 128) per channel
   6. BIH-GCN
        • Local graph  : intra-region GCN + attention pooling
        • Global graph : [global_emb | frontal_emb | temporal_emb] GCN
-  7. FC head         → 5-class softmax
+  7. FC head         → 4-class softmax
   8. Loss            : 0.9 × weighted-CE  +  0.1 × focal loss
   9. Evaluate with accuracy + macro-F1 over 30 random 80/20 splits
 
@@ -89,8 +88,8 @@ logger = logging.getLogger("BIH-GCN.Test")
 FS             = 128          # Emognition sampling rate
 SEG_SAMPLES    = 512          # 4 s × 128 Hz
 N_CHANNELS     = 4
-N_CLASSES      = 5
-EMOTION_NAMES  = ["enthusiasm", "neutral", "fear", "sadness", "amusement"]
+N_CLASSES      = 4
+EMOTION_NAMES  = ["enthusiasm", "neutral", "fear", "sadness"]
 
 # Electrode → region mapping for Emognition 4-channel cap
 # Channels 0,1 → Frontal  |  Channels 2,3 → Temporal
@@ -331,10 +330,10 @@ class BIHGCN(nn.Module):
 
     def forward(self, specs: torch.Tensor) -> torch.Tensor:
         """specs: (B, C, F, T)"""
-        B, C, F, T = specs.shape
+        B, C, Freq, Time = specs.shape
 
         # ── CNN per channel ───────────────────────────────────────────────────
-        x_flat   = specs.view(B * C, 1, F, T)
+        x_flat   = specs.view(B * C, 1, Freq, Time)
         ch_embs  = self.cnn_enc(x_flat).view(B, C, -1)   # (B, C, embed_dim)
 
         # ── Global embedding (mean across channels) ───────────────────────────
@@ -412,6 +411,44 @@ def make_dummy_data(n_segments: int = 200,
 #  DATA LOADING  (reuse existing loader or stub)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _rewindow(segments: np.ndarray, labels: np.ndarray,
+              trial_ids: np.ndarray,
+              target: int = SEG_SAMPLES) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    If the loader returned segments longer than `target` samples, split each
+    segment into non-overlapping sub-windows of exactly `target` samples.
+    Labels and trial_ids are broadcast to match.
+    If segments are already `target` samples wide, returns inputs unchanged.
+    """
+    N, C, T = segments.shape
+    if T == target:
+        return segments, labels, trial_ids
+
+    n_sub = T // target          # number of sub-windows per segment
+    if n_sub < 1:
+        raise ValueError(
+            f"Segment length {T} is shorter than target {target}. "
+            "Reduce SEG_SAMPLES or check the loader's segment_duration."
+        )
+
+    new_segs  = np.zeros((N * n_sub, C, target), dtype=segments.dtype)
+    new_labs  = np.zeros(N * n_sub, dtype=labels.dtype)
+    new_tids  = np.zeros(N * n_sub, dtype=trial_ids.dtype)
+
+    for i in range(N):
+        for j in range(n_sub):
+            idx = i * n_sub + j
+            new_segs[idx] = segments[i, :, j * target: (j + 1) * target]
+            new_labs[idx] = labels[i]
+            new_tids[idx] = trial_ids[i]
+
+    logger.info(
+        f"Re-windowed {N} × {T}-sample segments → "
+        f"{N * n_sub} × {target}-sample segments  (×{n_sub} per original)"
+    )
+    return new_segs, new_labs, new_tids
+
+
 def load_emognition_data(data_path: str,
                          subject_id: Optional[str] = None,
                          lead_in: float = 5.0,
@@ -426,7 +463,6 @@ def load_emognition_data(data_path: str,
         logger.warning("Real data unavailable – using DUMMY data for smoke-test.")
         return make_dummy_data()
 
-    # Build a minimal WEAVEConfig compatible with the existing loader
     cfg = WEAVEConfig(
         dataset            = "emognition",
         data_path          = data_path,
@@ -444,6 +480,18 @@ def load_emognition_data(data_path: str,
     except Exception as exc:
         logger.warning(f"Loader raised {exc}  →  falling back to DUMMY data.")
         return make_dummy_data()
+
+    # ── Drop any segments whose label index is outside [0, N_CLASSES-1] ──────
+    valid_mask = raw_labels < N_CLASSES
+    if not valid_mask.all():
+        n_dropped = int((~valid_mask).sum())
+        logger.warning(f"Dropping {n_dropped} segments with out-of-range labels.")
+        raw_segs, raw_labels, trial_ids = (
+            raw_segs[valid_mask], raw_labels[valid_mask], trial_ids[valid_mask]
+        )
+
+    # ── Re-window to SEG_SAMPLES if the loader returned longer segments ───────
+    raw_segs, raw_labels, trial_ids = _rewindow(raw_segs, raw_labels, trial_ids)
 
     # ── Preprocess each segment ───────────────────────────────────────────────
     logger.info("Preprocessing segments …")
@@ -512,7 +560,7 @@ def run_evaluation(spectrograms: np.ndarray,
     30 × stratified 80/20 train/test splits (trial-level).
     Returns summary dict with mean/std of acc and F1.
     """
-    N, C, F, T = spectrograms.shape
+    N, C, Freq, Time = spectrograms.shape
 
     # ── Trial-level split indices ─────────────────────────────────────────────
     unique_trials = np.unique(trial_ids)
@@ -554,8 +602,8 @@ def run_evaluation(spectrograms: np.ndarray,
 
         # ── Model ─────────────────────────────────────────────────────────────
         model = BIHGCN(
-            freq_bins   = F,
-            time_frames = T,
+            freq_bins   = Freq,
+            time_frames = Time,
             n_classes   = N_CLASSES,
             embed_dim   = CNN_EMBED_DIM,
             gcn_hidden  = GCN_HIDDEN,
@@ -764,7 +812,7 @@ def main():
     logger.info("=" * 60)
     logger.info(f"  FINAL  Accuracy : {summary['acc_mean']:.4f} ± {summary['acc_std']:.4f}")
     logger.info(f"  FINAL  Macro-F1 : {summary['f1_mean']:.4f} ± {summary['f1_std']:.4f}")
-    logger.info(f"  (Chance level for 5 classes = 0.20)")
+    logger.info(f"  (Chance level for 4 classes = 0.25)")
     logger.info("=" * 60)
 
 
