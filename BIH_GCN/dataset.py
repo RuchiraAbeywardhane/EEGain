@@ -1,305 +1,410 @@
 """
-Dataset loader for the EEG-only BIH_GCN pipeline.
+Dataset loaders for the BIH_GCN pipeline.
 
-Supports:
-  - DEAP       : 32 subjects, 32 EEG channels, 128 Hz, 40 trials × 60s
-  - Emognition : 43 subjects, 4 EEG channels (TP9,AF7,AF8,TP10), 256 Hz
-                 Folder structure:
-                   <data_path>/
-                     Participant_<id>/
-                       EEG_<id>_<emotion>.csv   (columns: timestamps + 4 EEG ch)
-                       OR a single EEG CSV with a label column
+Returns raw EEG segments [N, C, T], labels [N].
+Ported directly from the proven weave_pipeline/dataset.py loader.
 
-Returns:
-  segments  : np.ndarray  [N, C, T]   float32
-  labels    : np.ndarray  [N]         int
+DEAP
+----
+File : s{id:02d}.dat  (pickle, latin-1)
+  1. Separate baseline (first 384 samples) from stimulus
+  2. Baseline-removal
+  3. Z-score per channel
+  4. Segment into non-overlapping windows
+  5. Binary label: score > threshold → 1 (High), else → 0 (Low)
+
+Emognition
+----------
+JSON files (STIMULUS_MUSE only, 4 EEG channels at 256 Hz):
+  1. Quality filter  (HSI ≤ 2, HeadBandOn = 1)
+  2. Discard lead-in  →  extract baseline  →  baseline-removal
+  3. Z-score per channel
+  4. Segment into non-overlapping windows
+  5. Label from emognition_class_map
 """
 
 import os
 import glob
+import json
+import pickle
 import logging
 import numpy as np
-import pickle
-import pandas as pd
-from typing import Optional, Tuple
+from typing import List, Tuple, Optional
 
 from BIH_GCN.config import BIHGCNConfig
 
 logger = logging.getLogger("BIH_GCN.Dataset")
 
+# ── DEAP constants ─────────────────────────────────────────────────────────────
+_LABEL_IDX        = {"V": 0, "A": 1, "D": 2, "L": 3}
+_BASELINE_SAMPLES = 384      # 3 s × 128 Hz
+_N_EEG_CHANNELS   = 32
+_DEAP_SRATE       = 128
 
-# ── Segmentation helper ───────────────────────────────────────────────────────
-
-def _segment(data: np.ndarray, seg_samples: int,
-             step: Optional[int] = None) -> np.ndarray:
-    """
-    data : [C, T]
-    returns: [N_seg, C, seg_samples]  non-overlapping windows
-    """
-    if step is None:
-        step = seg_samples
-    C, T = data.shape
-    starts = range(0, T - seg_samples + 1, step)
-    segs = [data[:, s:s + seg_samples] for s in starts]
-    if not segs:
-        return np.empty((0, C, seg_samples), dtype=np.float32)
-    return np.stack(segs, axis=0)
-
-
-# ── DEAP ──────────────────────────────────────────────────────────────────────
-
-def _load_deap(cfg: BIHGCNConfig,
-               subject_id: Optional[int]) -> Tuple[np.ndarray, np.ndarray]:
-    seg_samples = cfg.segment_samples
-    files = sorted(glob.glob(os.path.join(cfg.data_path, "s*.dat")))
-
-    if not files:
-        raise FileNotFoundError(f"No DEAP .dat files found in {cfg.data_path}")
-
-    if subject_id is not None:
-        tag   = f"s{subject_id:02d}.dat"
-        files = [f for f in files if os.path.basename(f) == tag]
-        if not files:
-            raise FileNotFoundError(f"Subject file {tag} not found.")
-
-    all_segs, all_labels = [], []
-
-    for fpath in files:
-        logger.info(f"  Loading {os.path.basename(fpath)} …")
-        with open(fpath, "rb") as fh:
-            data = pickle.load(fh, encoding="latin1")
-
-        eeg    = data["data"][:, :32, 128 * 3:]
-        rating = data["labels"]
-        dim    = 0 if cfg.label_type == "V" else 1
-
-        for trial_idx in range(eeg.shape[0]):
-            score = rating[trial_idx, dim]
-            label = int(score > cfg.ground_truth_threshold)
-            segs  = _segment(eeg[trial_idx], seg_samples)
-            if segs.shape[0] == 0:
-                continue
-            all_segs.append(segs)
-            all_labels.extend([label] * len(segs))
-
-    segments = np.concatenate(all_segs, axis=0).astype(np.float32)
-    labels   = np.array(all_labels, dtype=np.int64)
-    return segments, labels
-
-
-# ── Emognition ────────────────────────────────────────────────────────────────
-
-_EMOG_LABEL_MAP = {
-    "enthusiasm": 0,
-    "neutral"   : 1,
-    "fear"      : 2,
-    "sadness"   : 3,
+# ── Emognition class map ───────────────────────────────────────────────────────
+_EMOG_CLASS_MAP = {
+    "ENTHUSIASM": 0,
+    "NEUTRAL":    1,
+    "FEAR":       2,
+    "SADNESS":    3,
 }
 
-# EEG column names used in Emognition CSVs (Muse headset)
-_EEG_COLS = ["RAW_TP9", "RAW_AF7", "RAW_AF8", "RAW_TP10"]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SHARED SIGNAL UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _baseline_removal(trial: np.ndarray, baseline: np.ndarray,
+                      segment_len: int) -> np.ndarray:
+    C, T_base = baseline.shape
+    n_seg     = T_base // segment_len
+    if n_seg == 0:
+        return trial - baseline.mean(axis=1, keepdims=True)
+    segs      = np.stack(
+        [baseline[:, i * segment_len:(i + 1) * segment_len] for i in range(n_seg)],
+        axis=0)
+    base_mean = segs.mean(axis=0)
+    C_t, T_trial = trial.shape
+    n_tiles   = T_trial // segment_len
+    remainder = T_trial %  segment_len
+    tiled     = np.tile(base_mean, (1, n_tiles))
+    if remainder > 0:
+        tiled = np.concatenate([tiled, base_mean[:, :remainder]], axis=1)
+    return trial - tiled[:, :T_trial]
 
 
-def _find_emog_files(data_path: str, subject_id: Optional[str]):
-    """
-    Recursively search for all JSON files under data_path.
-    Emognition layout:
-      <data_path>/
-        Participant_<id>/
-          <emotion>_<id>.json   OR   <id>_<emotion>.json
-    """
-    all_json = sorted(glob.glob(
-        os.path.join(data_path, "**", "*.json"), recursive=True
-    ))
-
-    if not all_json:
-        raise FileNotFoundError(f"No JSON files found under {data_path}")
-
-    if subject_id is not None:
-        all_json = [f for f in all_json if subject_id in os.path.basename(f)
-                    or subject_id in os.path.basename(os.path.dirname(f))]
-        if not all_json:
-            raise FileNotFoundError(
-                f"No JSON files found for subject '{subject_id}' under {data_path}"
-            )
-
-    return all_json
+def _zscore_1d(eeg: np.ndarray) -> np.ndarray:
+    eeg = eeg.astype(np.float32, copy=True)
+    for c in range(eeg.shape[0]):
+        mu  = eeg[c].mean()
+        sig = eeg[c].std()
+        eeg[c] = (eeg[c] - mu) / max(sig, 1e-8)
+    return eeg
 
 
-def _infer_label_from_path(fpath: str) -> int:
-    """Try to infer emotion label from the file/folder name."""
-    name = (os.path.basename(fpath) + " " +
-            os.path.basename(os.path.dirname(fpath))).lower()
-    for emotion, idx in _EMOG_LABEL_MAP.items():
-        if emotion in name:
-            return idx
-    return -1
+def _segment_signal(eeg: np.ndarray, segment_samples: int) -> np.ndarray:
+    C, T   = eeg.shape
+    n_segs = T // segment_samples
+    if n_segs == 0:
+        return np.empty((0, C, segment_samples), dtype=np.float32)
+    return np.stack(
+        [eeg[:, i * segment_samples:(i + 1) * segment_samples]
+         for i in range(n_segs)], axis=0
+    ).astype(np.float32)
 
 
-def _safe_stack(arrays: list) -> np.ndarray:
-    """
-    Stack arrays along the first axis, truncating to the minimum length.
-    """
-    min_len = min(len(arr) for arr in arrays)
-    return np.stack([arr[:min_len] for arr in arrays], axis=0)
+# ══════════════════════════════════════════════════════════════════════════════
+#  DEAP LOADER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_deap_subject_ids(cfg: BIHGCNConfig) -> List[int]:
+    ids = []
+    for fname in os.listdir(cfg.data_path):
+        if fname.startswith("s") and fname.endswith(".dat"):
+            try:
+                ids.append(int(fname[1:-4]))
+            except ValueError:
+                pass
+    return sorted(ids)
 
 
-def _load_eeg_from_json(fpath: str) -> Tuple[Optional[np.ndarray], int]:
-    """
-    Load EEG data from an Emognition JSON file.
+def load_deap_subject(
+    subject_id: int,
+    cfg: BIHGCNConfig,
+) -> Tuple[np.ndarray, np.ndarray]:
+    fpath = os.path.join(cfg.data_path, f"s{subject_id:02d}.dat")
+    with open(fpath, "rb") as f:
+        subject_data = pickle.load(f, encoding="latin-1")
 
-    Expected JSON structures (tries all):
-      A) { "eeg": [[ch0_t0, ch1_t0, ...], ...],  "label": "fear" }
-      B) { "RAW_TP9": [...], "RAW_AF7": [...], ... }
-      C) { "data": { "RAW_TP9": [...], ... }, "label": "fear" }
-      D) list of records: [{"RAW_TP9": v, "RAW_AF7": v, ...}, ...]
+    raw_data   = subject_data["data"]    # [40, 40, 8064]
+    raw_labels = subject_data["labels"]  # [40, 4]
 
-    Returns (eeg [C, T] float32  or  None,  label int  or  -1)
-    """
-    import json
-    try:
-        with open(fpath, "r") as fh:
-            raw = json.load(fh)
-    except Exception as e:
-        logger.warning(f"  Could not read {fpath}: {e}")
-        return None, -1
-
-    label = -1
-    eeg   = None
-
-    # ── Extract label from JSON if present ────────────────────────────────────
-    if isinstance(raw, dict):
-        for key in ("label", "emotion", "class", "stimulus"):
-            if key in raw:
-                label = _EMOG_LABEL_MAP.get(str(raw[key]).lower(), -1)
-                break
-
-    # ── Structure A: {"eeg": [[sample0], [sample1], ...]} ────────────────────
-    if isinstance(raw, dict) and "eeg" in raw:
-        arr = np.array(raw["eeg"], dtype=np.float32)
-        if arr.ndim == 2:
-            eeg = arr.T if arr.shape[1] <= 8 else arr
-
-    # ── Structure B/C: flat or nested dict of channel arrays ─────────────────
-    elif isinstance(raw, dict):
-        data_dict = raw.get("data", raw)
-        present   = [c for c in _EEG_COLS if c in data_dict]
-        if len(present) == 4:
-            eeg = _safe_stack([data_dict[c] for c in present])
-        else:
-            num_keys = [k for k, v in data_dict.items()
-                        if isinstance(v, (list, np.ndarray))
-                        and not any(x in k.lower()
-                                    for x in ["time", "unix", "marker",
-                                              "label", "trigger", "index"])]
-            if len(num_keys) >= 4:
-                eeg = _safe_stack([data_dict[k] for k in num_keys[:4]])
-
-    # ── Structure D: list of per-sample dicts ─────────────────────────────────
-    elif isinstance(raw, list) and len(raw) > 0 and isinstance(raw[0], dict):
-        df      = pd.DataFrame(raw)
-        present = [c for c in _EEG_COLS if c in df.columns]
-        if len(present) == 4:
-            eeg = df[present].values.T.astype(np.float32)
-        else:
-            num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            num_cols = [c for c in num_cols
-                        if not any(k in c.lower()
-                                   for k in ["time", "unix", "marker", "label",
-                                             "trigger", "index", "id"])]
-            if len(num_cols) >= 4:
-                eeg = df[num_cols[:4]].values.T.astype(np.float32)
-
-    if eeg is not None:
-        # Ensure shape is exactly [4, T] — drop extra channels
-        if eeg.shape[0] > 4:
-            eeg = eeg[:4, :]
-
-    return eeg, label
-
-
-def _load_emognition(cfg: BIHGCNConfig,
-                     subject_id: Optional[str]) -> Tuple[np.ndarray, np.ndarray]:
-    seg_samples  = cfg.segment_samples
-    lead_samples = int(cfg.lead_in_duration * cfg.sampling_rate)
-
-    files = _find_emog_files(cfg.data_path, subject_id)
-    logger.info(f"  Found {len(files)} JSON file(s)")
+    label_col       = _LABEL_IDX.get(cfg.label_type.upper(), 0)
+    segment_samples = cfg.segment_samples
+    segment_len     = _DEAP_SRATE
 
     all_segs, all_labels = [], []
 
-    for fpath in files:
-        # ── Load EEG + label from JSON ─────────────────────────────────────────
-        eeg, label_from_json = _load_eeg_from_json(fpath)
+    for trial_idx in range(raw_data.shape[0]):
+        full  = raw_data[trial_idx, :_N_EEG_CHANNELS, :]
+        base  = full[:, :_BASELINE_SAMPLES]
+        trial = full[:, _BASELINE_SAMPLES:]
 
-        # Prefer label embedded in JSON; fall back to path-inferred label
-        label = label_from_json if label_from_json != -1 \
-                else _infer_label_from_path(fpath)
+        trial_clean = _baseline_removal(trial, base, segment_len)
+        trial_clean = _zscore_1d(trial_clean)
+        segs        = _segment_signal(trial_clean, segment_samples)
 
-        if label == -1:
-            logger.warning(f"  Skipping (no emotion label): "
-                           f"{os.path.basename(fpath)}")
-            continue
-
-        if eeg is None:
-            logger.warning(f"  Skipping (could not parse EEG): "
-                           f"{os.path.basename(fpath)}")
-            continue
-
-        if eeg.shape[0] != cfg.n_eeg_channels:
-            logger.warning(f"  Expected {cfg.n_eeg_channels} ch, "
-                           f"got {eeg.shape[0]} — skipping {os.path.basename(fpath)}")
-            continue
-
-        # ── Drop lead-in, segment ─────────────────────────────────────────────
-        eeg  = eeg[:, lead_samples:]
-        segs = _segment(eeg, seg_samples)
         if segs.shape[0] == 0:
-            logger.warning(f"  Too short for one segment: {os.path.basename(fpath)}")
             continue
 
-        logger.info(f"  {os.path.basename(fpath):50s}  "
-                    f"label={label}  segs={segs.shape[0]}")
+        raw_score = float(raw_labels[trial_idx, label_col])
+        label     = 1 if raw_score > cfg.ground_truth_threshold else 0
+
         all_segs.append(segs)
         all_labels.extend([label] * segs.shape[0])
 
     if not all_segs:
-        logger.error("No usable Emognition data found. "
-                     "Run a quick diagnostic:\n"
-                     "  import json; d=json.load(open('<any>.json')); print(type(d), list(d.keys()) if isinstance(d,dict) else d[0])")
-        return (np.empty((0, cfg.n_eeg_channels, cfg.segment_samples),
-                         dtype=np.float32),
-                np.empty(0, dtype=np.int64))
+        logger.warning(f"DEAP subject {subject_id:02d}: no segments produced")
+        empty = np.empty((0, _N_EEG_CHANNELS, segment_samples), dtype=np.float32)
+        return empty, np.empty((0,), dtype=np.int64)
 
-    segments = np.concatenate(all_segs, axis=0).astype(np.float32)
+    segments = np.concatenate(all_segs, axis=0)
     labels   = np.array(all_labels, dtype=np.int64)
+    logger.info(f"DEAP subject {subject_id:02d}: {segments.shape[0]} segments | "
+                f"class dist {np.bincount(labels).tolist()}")
     return segments, labels
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+def load_deap_all_subjects(cfg: BIHGCNConfig) -> Tuple[np.ndarray, np.ndarray]:
+    ids = get_deap_subject_ids(cfg)
+    all_segs, all_labels = [], []
+    for sid in ids:
+        segs, labels = load_deap_subject(sid, cfg)
+        if segs.shape[0]:
+            all_segs.append(segs)
+            all_labels.append(labels)
+    if not all_segs:
+        raise RuntimeError("No DEAP segments loaded — check data_path.")
+    return (np.concatenate(all_segs,   axis=0),
+            np.concatenate(all_labels, axis=0))
 
-def load_data(cfg: BIHGCNConfig,
-              subject_id=None) -> Tuple[np.ndarray, np.ndarray]:
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EMOGNITION LOADER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _emog_to_num(x) -> np.ndarray:
+    import pandas as pd
+    if isinstance(x, list):
+        if not x:
+            return np.array([], dtype=np.float64)
+        if isinstance(x[0], str):
+            return pd.to_numeric(pd.Series(x), errors="coerce").to_numpy(np.float64)
+        return np.asarray(x, dtype=np.float64)
+    return np.asarray([x], dtype=np.float64)
+
+
+def _emog_interp_nan(a: np.ndarray) -> np.ndarray:
+    a = a.astype(np.float64, copy=True)
+    m = np.isfinite(a)
+    if m.all():     return a
+    if not m.any(): return np.zeros_like(a)
+    idx   = np.arange(len(a))
+    a[~m] = np.interp(idx[~m], idx[m], a[m])
+    return a
+
+
+def _emog_is_stimulus_muse(fname: str) -> bool:
+    parts = fname.replace(".json", "").split("_")
+    return (len(parts) >= 4 and
+            parts[2].upper() == "STIMULUS" and
+            parts[3].upper() == "MUSE")
+
+
+def _emog_parse_emotion(fname: str) -> str:
+    return fname.split("_")[1].upper()
+
+
+def _emog_parse_subject(fname: str) -> str:
+    return fname.split("_")[0]
+
+
+def _emog_read_json(fpath: str) -> Optional[np.ndarray]:
+    with open(fpath, "r") as f:
+        data = json.load(f)
+
+    tp9  = _emog_interp_nan(_emog_to_num(data.get("RAW_TP9",  [])))
+    af7  = _emog_interp_nan(_emog_to_num(data.get("RAW_AF7",  [])))
+    af8  = _emog_interp_nan(_emog_to_num(data.get("RAW_AF8",  [])))
+    tp10 = _emog_interp_nan(_emog_to_num(data.get("RAW_TP10", [])))
+
+    L = min(len(tp9), len(af7), len(af8), len(tp10))
+    if L == 0:
+        return None
+
+    hsi_tp9  = _emog_to_num(data.get("HSI_TP9",  []))[:L]
+    hsi_af7  = _emog_to_num(data.get("HSI_AF7",  []))[:L]
+    hsi_af8  = _emog_to_num(data.get("HSI_AF8",  []))[:L]
+    hsi_tp10 = _emog_to_num(data.get("HSI_TP10", []))[:L]
+    head_on  = _emog_to_num(data.get("HeadBandOn", []))[:L]
+
+    mask = (np.isfinite(tp9[:L]) & np.isfinite(af7[:L]) &
+            np.isfinite(af8[:L]) & np.isfinite(tp10[:L]))
+    if len(head_on) == L and len(hsi_tp9) == L:
+        mask &= (
+            (head_on == 1) &
+            np.isfinite(hsi_tp9)  & (hsi_tp9  <= 2) &
+            np.isfinite(hsi_af7)  & (hsi_af7  <= 2) &
+            np.isfinite(hsi_af8)  & (hsi_af8  <= 2) &
+            np.isfinite(hsi_tp10) & (hsi_tp10 <= 2)
+        )
+
+    tp9  = tp9[:L][mask];  af7  = af7[:L][mask]
+    af8  = af8[:L][mask];  tp10 = tp10[:L][mask]
+    if len(tp9) == 0:
+        return None
+
+    signal  = np.stack([tp9, af7, af8, tp10], axis=1).T.astype(np.float32)
+    signal -= signal.mean(axis=1, keepdims=True)
+    return signal   # [4, T]
+
+
+def get_emognition_subject_ids(cfg: BIHGCNConfig) -> List[str]:
+    patterns = [
+        os.path.join(cfg.data_path, "*",      "*.json"),
+        os.path.join(cfg.data_path,            "*.json"),
+        os.path.join(cfg.data_path, "*", "*", "*.json"),
+    ]
+    files    = sorted({p for pat in patterns for p in glob.glob(pat)})
+    subjects = set()
+    for fpath in files:
+        fname = os.path.basename(fpath)
+        if not _emog_is_stimulus_muse(fname):
+            continue
+        if _emog_parse_emotion(fname) in _EMOG_CLASS_MAP:
+            subjects.add(_emog_parse_subject(fname))
+    return sorted(subjects)
+
+
+def _emog_find_trials(subject_id: str, cfg: BIHGCNConfig) -> List[Tuple[str, int]]:
+    patterns = [
+        os.path.join(cfg.data_path, subject_id, "*.json"),
+        os.path.join(cfg.data_path,              "*.json"),
+        os.path.join(cfg.data_path, "*", subject_id, "*.json"),
+    ]
+    files  = sorted({p for pat in patterns for p in glob.glob(pat)})
+    result = []
+    for fpath in files:
+        fname = os.path.basename(fpath)
+        if _emog_parse_subject(fname) != subject_id:
+            continue
+        if not _emog_is_stimulus_muse(fname):
+            continue
+        label = _EMOG_CLASS_MAP.get(_emog_parse_emotion(fname))
+        if label is None:
+            continue
+        result.append((fpath, label))
+    return sorted(result)
+
+
+def load_emognition_subject(
+    subject_id: str,
+    cfg: BIHGCNConfig,
+) -> Tuple[np.ndarray, np.ndarray]:
+    srate            = 256
+    segment_samples  = cfg.segment_samples
+    lead_in_samples  = int(cfg.lead_in_duration  * srate)
+    baseline_samples = int(cfg.baseline_duration * srate)
+    segment_len      = srate
+    min_needed       = lead_in_samples + baseline_samples + segment_samples
+
+    trial_files = _emog_find_trials(subject_id, cfg)
+    if not trial_files:
+        logger.warning(f"Emognition: no trials found for subject '{subject_id}'")
+        empty = np.empty((0, 4, segment_samples), dtype=np.float32)
+        return empty, np.empty((0,), dtype=np.int64)
+
+    all_segs, all_labels = [], []
+    skipped = 0
+
+    for fpath, label in trial_files:
+        fname  = os.path.basename(fpath)
+        signal = _emog_read_json(fpath)
+
+        if signal is None:
+            logger.warning(f"  Skipping {fname}: empty after quality filter")
+            skipped += 1
+            continue
+        if signal.shape[1] < min_needed:
+            logger.warning(f"  Skipping {fname}: only {signal.shape[1]} samples "
+                           f"(need ≥ {min_needed})")
+            skipped += 1
+            continue
+
+        trimmed  = signal[:, lead_in_samples:]
+        baseline = trimmed[:, :baseline_samples]
+        stimulus = trimmed[:, baseline_samples:]
+
+        try:
+            clean = _baseline_removal(stimulus, baseline, segment_len)
+        except Exception as e:
+            logger.warning(f"  Skipping {fname}: baseline removal error: {e}")
+            skipped += 1
+            continue
+
+        clean = _zscore_1d(clean)
+        segs  = _segment_signal(clean, segment_samples)
+
+        if segs.shape[0] == 0:
+            logger.warning(f"  Skipping {fname}: 0 segments produced")
+            skipped += 1
+            continue
+
+        all_segs.append(segs)
+        all_labels.extend([label] * segs.shape[0])
+        logger.debug(f"  {subject_id} | {fname} | label={label} | segs={segs.shape[0]}")
+
+    if not all_segs:
+        empty = np.empty((0, 4, segment_samples), dtype=np.float32)
+        return empty, np.empty((0,), dtype=np.int64)
+
+    segments = np.concatenate(all_segs, axis=0)
+    labels   = np.array(all_labels, dtype=np.int64)
+    logger.info(
+        f"Emognition subject {subject_id}: {segments.shape[0]} segments | "
+        f"{skipped} skipped | "
+        f"class dist {np.bincount(labels, minlength=cfg.n_classes).tolist()}"
+    )
+    return segments, labels
+
+
+def load_emognition_all_subjects(cfg: BIHGCNConfig) -> Tuple[np.ndarray, np.ndarray]:
+    ids = get_emognition_subject_ids(cfg)
+    logger.info(f"Found {len(ids)} Emognition subjects: {ids}")
+    all_segs, all_labels = [], []
+    for sid in ids:
+        segs, labels = load_emognition_subject(sid, cfg)
+        if segs.shape[0]:
+            all_segs.append(segs)
+            all_labels.append(labels)
+    if not all_segs:
+        raise RuntimeError("No Emognition segments loaded — check data_path.")
+    return (np.concatenate(all_segs,   axis=0),
+            np.concatenate(all_labels, axis=0))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UNIFIED API
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_data(
+    cfg: BIHGCNConfig,
+    subject_id=None,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Load EEG segments and labels for the configured dataset.
 
-    Parameters
-    ----------
-    cfg        : BIHGCNConfig
-    subject_id : int (DEAP) | str (Emognition) | None = all subjects
+    Args:
+        cfg        : BIHGCNConfig
+        subject_id : int (DEAP) | str (Emognition) | None → all subjects
 
-    Returns
-    -------
-    segments : [N, C, T]  float32
-    labels   : [N]        int64
+    Returns:
+        segments : [N, C, T]  float32
+        labels   : [N]        int64
     """
-    if cfg.dataset == "deap":
-        segments, labels = _load_deap(cfg, subject_id)
-    elif cfg.dataset == "emognition":
-        segments, labels = _load_emognition(cfg, subject_id)
-    else:
-        raise ValueError(f"Unknown dataset: {cfg.dataset}")
+    is_emog = cfg.dataset.lower() == "emognition"
 
-    logger.info(f"Loaded {len(segments)} segments  shape={segments.shape}  "
+    if subject_id is not None:
+        if is_emog:
+            segments, labels = load_emognition_subject(str(subject_id), cfg)
+        else:
+            segments, labels = load_deap_subject(int(subject_id), cfg)
+    else:
+        if is_emog:
+            segments, labels = load_emognition_all_subjects(cfg)
+        else:
+            segments, labels = load_deap_all_subjects(cfg)
+
+    logger.info(f"Total: {len(segments)} segments | shape={segments.shape} | "
                 f"class dist={np.bincount(labels, minlength=cfg.n_classes).tolist()}")
     return segments, labels
