@@ -263,11 +263,13 @@ def _load_seediv_mat(fpath: str) -> Optional[Tuple[np.ndarray, Optional[List[int
                 logger.debug(f"  Format A ({key}): shape={arr.shape}")
                 return arr[:62], None
 
-    # ── Format B: per-trial raw EEG  eeg1…eeg24 ──────────────────────────────
-    # Keys are like 'eeg1', 'eeg2', ... up to 'eeg24'
+    # ── Format B: per-trial raw EEG  eeg1…eeg24  OR  {initials}_eeg1…eeg24 ───
+    # Kaggle release uses subject-initials prefix: e.g. hql_eeg1, ldy_eeg1 …
+    import re as _re
+    _EEG_TRIAL_RE = _re.compile(r'^(?:[a-z]+_)?eeg(\d+)$', _re.IGNORECASE)
     eeg_trial_keys = sorted(
-        [k for k in data_keys if k.startswith("eeg") and k[3:].isdigit()],
-        key=lambda k: int(k[3:])
+        [k for k in data_keys if _EEG_TRIAL_RE.match(k)],
+        key=lambda k: int(_EEG_TRIAL_RE.match(k).group(1))
     )
     if eeg_trial_keys:
         logger.debug(f"  Format B: found {len(eeg_trial_keys)} per-trial EEG keys "
