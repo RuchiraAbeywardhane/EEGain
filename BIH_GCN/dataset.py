@@ -136,6 +136,14 @@ def _infer_label_from_path(fpath: str) -> int:
     return -1
 
 
+def _safe_stack(arrays: list) -> np.ndarray:
+    """
+    Stack arrays along the first axis, truncating to the minimum length.
+    """
+    min_len = min(len(arr) for arr in arrays)
+    return np.stack([arr[:min_len] for arr in arrays], axis=0)
+
+
 def _load_eeg_from_json(fpath: str) -> Tuple[Optional[np.ndarray], int]:
     """
     Load EEG data from an Emognition JSON file.
@@ -168,31 +176,28 @@ def _load_eeg_from_json(fpath: str) -> Tuple[Optional[np.ndarray], int]:
 
     # ── Structure A: {"eeg": [[sample0], [sample1], ...]} ────────────────────
     if isinstance(raw, dict) and "eeg" in raw:
-        arr = np.array(raw["eeg"], dtype=np.float32)   # [T, C] or [C, T]
+        arr = np.array(raw["eeg"], dtype=np.float32)
         if arr.ndim == 2:
-            eeg = arr.T if arr.shape[1] <= 8 else arr   # heuristic: C is smaller dim
+            eeg = arr.T if arr.shape[1] <= 8 else arr
 
-    # ── Structure B: flat dict of channel arrays ──────────────────────────────
+    # ── Structure B/C: flat or nested dict of channel arrays ─────────────────
     elif isinstance(raw, dict):
-        data_dict = raw.get("data", raw)               # unwrap "data" key if present
+        data_dict = raw.get("data", raw)
         present   = [c for c in _EEG_COLS if c in data_dict]
         if len(present) == 4:
-            eeg = np.array([data_dict[c] for c in present],
-                           dtype=np.float32)            # [4, T]
+            eeg = _safe_stack([data_dict[c] for c in present])
         else:
-            # Fallback: first 4 numeric-valued keys
             num_keys = [k for k, v in data_dict.items()
                         if isinstance(v, (list, np.ndarray))
                         and not any(x in k.lower()
                                     for x in ["time", "unix", "marker",
                                               "label", "trigger", "index"])]
             if len(num_keys) >= 4:
-                eeg = np.array([data_dict[k] for k in num_keys[:4]],
-                               dtype=np.float32)        # [4, T]
+                eeg = _safe_stack([data_dict[k] for k in num_keys[:4]])
 
     # ── Structure D: list of per-sample dicts ─────────────────────────────────
     elif isinstance(raw, list) and len(raw) > 0 and isinstance(raw[0], dict):
-        df  = pd.DataFrame(raw)
+        df      = pd.DataFrame(raw)
         present = [c for c in _EEG_COLS if c in df.columns]
         if len(present) == 4:
             eeg = df[present].values.T.astype(np.float32)
