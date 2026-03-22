@@ -24,19 +24,19 @@ class BIHGCNConfig:
     class_names: List[str] = field(default_factory=lambda: ["Low", "High"])
 
     # ── Spectrogram ───────────────────────────────────────────────────────────
-    stft_n_fft: int      = 128
-    stft_hop: int        = 32
-    stft_n_mels: int     = 64             # freq bins fed to Mamba encoder
+    stft_n_fft: int      = 64             # smaller FFT → fewer freq bins → faster
+    stft_hop: int        = 16
+    stft_n_mels: int     = 32             # must be ≤ n_fft//2 + 1 = 33
 
     # ── Mamba Encoder ─────────────────────────────────────────────────────────
-    mamba_d_model: int   = 128            # token dimension
-    mamba_n_layers: int  = 4
+    mamba_d_model: int   = 64             # reduced from 128 – less overfit on small data
+    mamba_n_layers: int  = 2              # reduced from 4
     mamba_d_state: int   = 16
     mamba_d_conv: int    = 4
     mamba_expand: int    = 2
 
     # ── Projection ────────────────────────────────────────────────────────────
-    proj_dim: int        = 128            # projected channel-token dimension
+    proj_dim: int        = 64             # reduced from 128
 
     # ── Anatomical Brain Regions ──────────────────────────────────────────────
     # Keys = region names, values = 0-based channel indices (DEAP 32-ch layout)
@@ -48,22 +48,23 @@ class BIHGCNConfig:
     })
 
     # ── BIH-GCN Stage 1 (local, per-region) ──────────────────────────────────
-    gcn1_hidden: int     = 128
-    gcn1_out: int        = 128
-    gcn1_heads: int      = 4              # attention-pooling heads
+    gcn1_hidden: int     = 64             # reduced from 128
+    gcn1_out: int        = 64
+    gcn1_heads: int      = 2              # reduced from 4
 
     # ── BIH-GCN Stage 2 (global, cross-region) ────────────────────────────────
-    gcn2_hidden: int     = 128
-    gcn2_out: int        = 128
+    gcn2_hidden: int     = 64             # reduced from 128
+    gcn2_out: int        = 64
 
     # ── Classifier ────────────────────────────────────────────────────────────
-    clf_dropout: float   = 0.3
+    clf_dropout: float   = 0.4
 
     # ── Training ──────────────────────────────────────────────────────────────
-    batch_size: int      = 32
-    lr: float            = 1e-3
-    weight_decay: float  = 1e-4
-    epochs: int          = 50
+    batch_size: int      = 16             # smaller batch → more gradient updates
+    lr: float            = 3e-4           # reduced from 1e-3
+    weight_decay: float  = 1e-3           # stronger regularisation
+    epochs: int          = 150            # more epochs with early stopping
+    patience: int        = 20             # early stopping patience
     seed: int            = 42
     test_size: float     = 0.2
     n_repetitions: int   = 10

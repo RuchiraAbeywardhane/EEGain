@@ -57,9 +57,10 @@ def parse_args() -> argparse.Namespace:
     grp.add_argument("--all_subjects", action="store_true")
 
     p.add_argument("--segment_dur",  default=6.0,   type=float)
-    p.add_argument("--epochs",       default=50,    type=int)
-    p.add_argument("--batch_size",   default=32,    type=int)
-    p.add_argument("--lr",           default=1e-3,  type=float)
+    p.add_argument("--epochs",       default=150,   type=int)
+    p.add_argument("--patience",     default=20,    type=int)
+    p.add_argument("--batch_size",   default=16,    type=int)
+    p.add_argument("--lr",           default=3e-4,  type=float)
     p.add_argument("--n_reps",       default=10,    type=int)
     p.add_argument("--test_size",    default=0.2,   type=float)
     p.add_argument("--seed",         default=42,    type=int)
@@ -82,6 +83,7 @@ def _make_config(args) -> BIHGCNConfig:
         baseline_duration      = args.baseline_dur,
         segment_duration       = args.segment_dur,
         epochs                 = args.epochs,
+        patience               = args.patience,
         batch_size             = args.batch_size,
         lr                     = args.lr,
         n_repetitions          = args.n_reps,
