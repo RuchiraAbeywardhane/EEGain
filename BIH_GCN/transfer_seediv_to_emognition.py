@@ -188,24 +188,64 @@ EMOG_BRAIN_REGIONS: Dict[str, List[int]] = {
 _SEEDIV_TRIAL_LABELS = [1, 2, 3, 0, 2, 0, 0, 1, 0, 1, 2, 1, 1, 1, 2,
                          2, 1, 3, 2, 2, 3, 2, 3, 3, 0, 3, 0, 0, 2, 3,
                          0, 3, 3, 3, 2, 3, 2, 0, 1, 3, 0, 3, 3, 3, 3]
-# 3 sessions × 15 trials each = 45 entries (pad to 3 × 24 for safety)
+# 3 sessions × 24 trials each — official SEED-IV label order
 _SESSION_LABELS = {
-    1: [1,2,3,0,2,0,0,1,0,1,2,1,1,1,2,  2,1,3,2,2,3,2,3,3],
-    2: [0,3,0,0,2,3,3,3,3,3,3,2,3,2,0,  1,3,0,3,3,3,3,3,3],
-    3: [2,3,3,3,2,3,2,0,1,3,0,3,3,3,3,  0,3,3,3,2,3,2,3,3],
+    1: [1, 2, 3, 0, 2, 0, 0, 1, 0, 1, 2, 1, 1, 1, 2, 2, 1, 3, 2, 2, 3, 2, 3, 3],
+    2: [0, 3, 0, 0, 2, 3, 3, 3, 3, 3, 3, 2, 3, 2, 0, 1, 3, 0, 3, 3, 3, 3, 3, 3],
+    3: [2, 3, 3, 3, 2, 3, 2, 0, 1, 3, 0, 3, 3, 3, 3, 0, 3, 3, 3, 2, 3, 2, 3, 3],
 }
 
 
-def _load_seediv_mat(fpath: str) -> Optional[np.ndarray]:
+def inspect_seediv_mat(fpath: str) -> None:
+    """
+    Diagnostic helper — prints every key in a .mat file and its shape/type.
+    Call this manually to understand the file structure before running the
+    full pipeline:
+        from BIH_GCN.transfer_seediv_to_emognition import inspect_seediv_mat
+        inspect_seediv_mat("/path/to/1_20160518.mat")
+    """
+    try:
+        mat = loadmat(fpath, squeeze_me=True, struct_as_record=False)
+    except Exception as e:
+        print(f"[inspect] Cannot load {fpath}: {e}")
+        return
+    print(f"\n[inspect] Keys in {os.path.basename(fpath)}:")
+    for k, v in mat.items():
+        if k.startswith("__"):
+            continue
+        if hasattr(v, "shape"):
+            print(f"  {k:30s}  shape={v.shape}  dtype={v.dtype}")
+        elif isinstance(v, (list, tuple)):
+            print(f"  {k:30s}  list  len={len(v)}")
+        else:
+            print(f"  {k:30s}  type={type(v).__name__}  val={str(v)[:80]}")
+    print()
+
+
+def _load_seediv_mat(fpath: str) -> Optional[Tuple[np.ndarray, Optional[List[int]]]]:
     """
     Load one SEED-IV .mat file.
-    Returns raw EEG [62, T] if 'eeg_raw' key exists,
-    otherwise reconstructs a pseudo-signal from DE features.
 
-    DE features shape: (62, n_seg, 5_bands)  — stored as de_LDS1…de_LDS4
-    We take the DE values and treat them as a 1-D signal per channel
-    (concatenating bands to form a feature-vector "sequence").
-    This is the fallback when raw EEG is not available.
+    Handles ALL known SEED-IV release formats:
+
+    Format A  — raw EEG (rare, separate download)
+        Key:  eeg_raw / EEG / data   → (62, T)
+        Returns: ([62, T], None)
+
+    Format B  — per-trial raw EEG  (eeg_raw_data release)
+        Keys: eeg1, eeg2 … eeg24    → each (62, T_trial)
+        Returns: ([62, T_total], [label_per_sample])
+        ── This is the format at /kaggle/input/.../eeg_raw_data ──
+
+    Format C  — smoothed DE features (default BCMI release)
+        Keys: de_LDS1 … de_LDS24   → each (62, n_seg, 5)
+        or    smth_de_LDS1 …       → each (62, n_seg, 5)
+        Returns: ([62, total_segs*5], None)  ← pseudo-signal
+
+    Returns (signal [62, T], per_sample_labels or None)
+    Per-sample labels are only returned for Format B so that
+    load_seediv_subject() can assign labels without the proportional
+    heuristic.
     """
     try:
         mat = loadmat(fpath, squeeze_me=True, struct_as_record=False)
@@ -213,30 +253,67 @@ def _load_seediv_mat(fpath: str) -> Optional[np.ndarray]:
         logger.warning(f"  Cannot load {fpath}: {e}")
         return None
 
-    # ── Try raw EEG first ────────────────────────────────────────────────────
+    data_keys = [k for k in mat if not k.startswith("__")]
+
+    # ── Format A: single raw EEG array ───────────────────────────────────────
     for key in ("eeg_raw", "EEG", "data"):
         if key in mat:
             arr = np.array(mat[key], dtype=np.float32)
             if arr.ndim == 2 and arr.shape[0] in (62, 64):
-                return arr[:62]    # [62, T]
+                logger.debug(f"  Format A ({key}): shape={arr.shape}")
+                return arr[:62], None
 
-    # ── Fallback: DE features ────────────────────────────────────────────────
-    # Keys: de_LDS1, de_LDS2, de_LDS3, de_LDS4  shape (62, n_seg, 5)
-    de_arrays = []
-    for trial_key in sorted(k for k in mat if k.startswith("de_LDS")):
-        arr = np.array(mat[trial_key], dtype=np.float32)   # (62, n_seg, 5) or (62, n_seg)
-        if arr.ndim == 3:
-            de_arrays.append(arr)                           # keep all 5 bands
+    # ── Format B: per-trial raw EEG  eeg1…eeg24 ──────────────────────────────
+    # Keys are like 'eeg1', 'eeg2', ... up to 'eeg24'
+    eeg_trial_keys = sorted(
+        [k for k in data_keys if k.startswith("eeg") and k[3:].isdigit()],
+        key=lambda k: int(k[3:])
+    )
+    if eeg_trial_keys:
+        logger.debug(f"  Format B: found {len(eeg_trial_keys)} per-trial EEG keys "
+                     f"({eeg_trial_keys[0]}…{eeg_trial_keys[-1]})")
+        arrays, per_sample_labels = [], []
+        for t_idx, key in enumerate(eeg_trial_keys):
+            arr = np.array(mat[key], dtype=np.float32)   # (62, T_trial)
+            if arr.ndim != 2 or arr.shape[0] not in (62, 64):
+                logger.debug(f"    Skipping {key}: unexpected shape {arr.shape}")
+                continue
+            arrays.append(arr[:62])
+            per_sample_labels.append(t_idx)   # will be resolved to emotion later
+        if arrays:
+            concat = np.concatenate(arrays, axis=1)   # [62, T_total]
+            # Build sample-level index so caller knows which samples belong
+            # to which trial (used for label assignment)
+            trial_boundaries = np.cumsum([0] + [a.shape[1] for a in arrays])
+            return concat, trial_boundaries.tolist()
 
-    if not de_arrays:
-        logger.warning(f"  No usable data in {fpath}")
-        return None
+    # ── Format C: DE feature matrices  de_LDS1…de_LDS24 ─────────────────────
+    # Also handles smth_de_LDS* (smoothed variant) and de_movingAve*
+    for prefix in ("de_LDS", "smth_de_LDS", "de_movingAve"):
+        de_keys = sorted(
+            [k for k in data_keys if k.startswith(prefix) and k[len(prefix):].isdigit()],
+            key=lambda k: int(k[len(prefix):])
+        )
+        if de_keys:
+            logger.debug(f"  Format C ({prefix}): found {len(de_keys)} keys")
+            de_arrays = []
+            for key in de_keys:
+                arr = np.array(mat[key], dtype=np.float32)
+                if arr.ndim == 3 and arr.shape[0] in (62, 64):
+                    de_arrays.append(arr[:62])   # (62, n_seg, 5_bands)
+                elif arr.ndim == 2 and arr.shape[0] in (62, 64):
+                    de_arrays.append(arr[:62, :, np.newaxis])  # add band dim
+            if de_arrays:
+                combined = np.concatenate(de_arrays, axis=1)   # (62, total_segs, bands)
+                C, S, B  = combined.shape
+                return combined.reshape(C, S * B).astype(np.float32), None
 
-    # Stack trials: (62, total_segs, 5)
-    combined = np.concatenate(de_arrays, axis=1)   # (62, total_segs, 5)
-    # Treat each DE segment as a 5-sample "window" → [62, total_segs * 5]
-    C, S, B = combined.shape
-    return combined.reshape(C, S * B).astype(np.float32)
+    # ── Nothing matched — dump available keys to help debug ──────────────────
+    logger.warning(
+        f"  No usable data in {os.path.basename(fpath)}. "
+        f"Available keys: {[k for k in data_keys if not k.startswith('__')]}"
+    )
+    return None
 
 
 def load_seediv_subject(
@@ -250,10 +327,10 @@ def load_seediv_subject(
     Selects only the 4 channels matching Emognition.
     Remaps labels to Emognition label space.
 
-    Returns:
-        segments  [N, 4, segment_samples]
-        labels    [N]   int64  (Emognition label space)
-        clip_ids  [N]   int64  (unique per session×trial)
+    Handles both:
+      • Continuous signal  (Format A / C) → proportional label assignment
+      • Per-trial signal   (Format B)     → exact label assignment via
+                                            trial_boundaries
     """
     all_segs, all_labels, all_clip_ids = [], [], []
     clip_id = clip_id_offset
@@ -264,57 +341,72 @@ def load_seediv_subject(
             logger.warning(f"  Session dir not found: {session_dir}")
             continue
 
-        # Find the file for this subject in this session
         candidates = [
             f for f in os.listdir(session_dir)
             if f.startswith(f"{subject_id}_") and f.endswith(".mat")
         ]
         if not candidates:
-            logger.warning(f"  No .mat file for subject {subject_id} session {session}")
+            logger.warning(f"  No .mat for subject {subject_id} session {session}")
             continue
 
         fpath  = os.path.join(session_dir, candidates[0])
-        signal = _load_seediv_mat(fpath)   # [62, T] or None
+        result = _load_seediv_mat(fpath)
 
-        if signal is None:
+        if result is None:
             clip_id += len(_SESSION_LABELS.get(session, []))
             continue
 
-        # Select the 4 Emognition-matching channels
+        signal, trial_boundaries = result   # [62, T], list|None
         signal_4ch = signal[SEEDIV_CHANNEL_INDICES, :]   # [4, T]
+        trial_labels_raw = _SESSION_LABELS.get(session, [])
+        n_trials = len(trial_labels_raw)
+        C, T = signal_4ch.shape
 
-        # Segment the continuous signal into fixed windows
-        C, T   = signal_4ch.shape
+        # ── Format B: exact per-trial boundaries ─────────────────────────────
+        if trial_boundaries is not None and len(trial_boundaries) > 1:
+            for t_idx in range(min(len(trial_boundaries) - 1, n_trials)):
+                t_start = trial_boundaries[t_idx]
+                t_end   = trial_boundaries[t_idx + 1]
+                trial_sig = signal_4ch[:, t_start:t_end]
+                n_t = (t_end - t_start) // segment_samples
+                if n_t == 0:
+                    clip_id += 1
+                    continue
+                raw_label  = trial_labels_raw[t_idx]
+                emog_label = SEEDIV_TO_EMOG_LABEL[raw_label]
+                t_segs = np.stack([
+                    trial_sig[:, i * segment_samples:(i + 1) * segment_samples]
+                    for i in range(n_t)
+                ], axis=0).astype(np.float32)
+                all_segs.append(t_segs)
+                all_labels.extend([emog_label] * n_t)
+                all_clip_ids.extend([clip_id]  * n_t)
+                clip_id += 1
+            continue   # done with this session
+
+        # ── Format A / C: continuous signal → proportional assignment ─────────
         n_segs = T // segment_samples
         if n_segs == 0:
             logger.warning(f"  Subject {subject_id} session {session}: "
                            f"signal too short ({T} < {segment_samples})")
-            clip_id += len(_SESSION_LABELS.get(session, []))
+            clip_id += n_trials
             continue
 
-        # Assign trial-level labels using the session label vector
-        # We distribute n_segs windows across trials proportionally
-        trial_labels_raw = _SESSION_LABELS.get(session, [])
-        n_trials = len(trial_labels_raw)
-
         segs_per_trial = n_segs // max(n_trials, 1)
-        remainder      = n_segs % max(n_trials, 1)
-
+        remainder      = n_segs %  max(n_trials, 1)
         seg_start = 0
+
         for t_idx, raw_label in enumerate(trial_labels_raw):
             emog_label = SEEDIV_TO_EMOG_LABEL[raw_label]
             n_t = segs_per_trial + (1 if t_idx < remainder else 0)
             if n_t == 0:
                 clip_id += 1
                 continue
-
-            end = seg_start + n_t * segment_samples
-            trial_sig = signal_4ch[:, seg_start:end]
-            t_segs = np.stack(
-                [trial_sig[:, i * segment_samples:(i + 1) * segment_samples]
-                 for i in range(n_t)], axis=0
-            ).astype(np.float32)   # [n_t, 4, segment_samples]
-
+            trial_sig = signal_4ch[:, seg_start:seg_start + n_t * segment_samples]
+            t_segs = np.stack([
+                trial_sig[:, i * segment_samples:(i + 1) * segment_samples]
+                for i in range(n_t)
+            ], axis=0).astype(np.float32)
             all_segs.append(t_segs)
             all_labels.extend([emog_label] * n_t)
             all_clip_ids.extend([clip_id]  * n_t)
@@ -536,7 +628,7 @@ def pretrain_on_seediv(
     """
     logger.info("=" * 60)
     logger.info("  Phase 1 — Pre-training on SEED-IV")
-    logger.info(f"  Channels used : {[list(EMOG_TO_SEEDIV.keys())[i] for i in range(4)]}")
+    logger.info(f"  Channels used : {list(EMOG_TO_SEEDIV.keys())}")
     logger.info(f"  SEED-IV → Emog label map: {SEEDIV_TO_EMOG_LABEL}")
     logger.info(f"  Segments : {len(segments)}  |  "
                 f"class dist {np.bincount(labels, minlength=4).tolist()}")
