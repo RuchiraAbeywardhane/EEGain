@@ -1,26 +1,11 @@
 """
 Dataset loaders for the BIH_GCN pipeline.
 
-Returns raw EEG segments [N, C, T], labels [N].
-Ported directly from the proven weave_pipeline/dataset.py loader.
-
-DEAP
-----
-File : s{id:02d}.dat  (pickle, latin-1)
-  1. Separate baseline (first 384 samples) from stimulus
-  2. Baseline-removal
-  3. Z-score per channel
-  4. Segment into non-overlapping windows
-  5. Binary label: score > threshold → 1 (High), else → 0 (Low)
-
-Emognition
-----------
-JSON files (STIMULUS_MUSE only, 4 EEG channels at 256 Hz):
-  1. Quality filter  (HSI ≤ 2, HeadBandOn = 1)
-  2. Discard lead-in  →  extract baseline  →  baseline-removal
-  3. Z-score per channel
-  4. Segment into non-overlapping windows
-  5. Label from emognition_class_map
+Returns raw EEG segments [N, C, T], labels [N], clip_ids [N].
+clip_ids is an integer array where every window from the same
+original JSON file / DEAP trial shares the same ID.
+train.py uses clip_ids to split at the CLIP level so that NO
+window from a test clip ever appears in the train set.
 """
 
 import os
@@ -73,6 +58,9 @@ def _baseline_removal(trial: np.ndarray, baseline: np.ndarray,
     return trial - tiled[:, :T_trial]
 
 
+# ⚠️  _zscore_1d is intentionally NOT called in the dataset loader.
+# Normalisation must happen AFTER the train/test split in train.py
+# to avoid data leakage.
 def _zscore_1d(eeg: np.ndarray) -> np.ndarray:
     eeg = eeg.astype(np.float32, copy=True)
     for c in range(eeg.shape[0]):
@@ -111,7 +99,8 @@ def get_deap_subject_ids(cfg: BIHGCNConfig) -> List[int]:
 def load_deap_subject(
     subject_id: int,
     cfg: BIHGCNConfig,
-) -> Tuple[np.ndarray, np.ndarray]:
+    clip_id_offset: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     fpath = os.path.join(cfg.data_path, f"s{subject_id:02d}.dat")
     with open(fpath, "rb") as f:
         subject_data = pickle.load(f, encoding="latin-1")
@@ -123,7 +112,7 @@ def load_deap_subject(
     segment_samples = cfg.segment_samples
     segment_len     = _DEAP_SRATE
 
-    all_segs, all_labels = [], []
+    all_segs, all_labels, all_clip_ids = [], [], []
 
     for trial_idx in range(raw_data.shape[0]):
         full  = raw_data[trial_idx, :_N_EEG_CHANNELS, :]
@@ -131,7 +120,7 @@ def load_deap_subject(
         trial = full[:, _BASELINE_SAMPLES:]
 
         trial_clean = _baseline_removal(trial, base, segment_len)
-        trial_clean = _zscore_1d(trial_clean)
+        # ⚠️  NO _zscore_1d here — normalisation happens after split in train.py
         segs        = _segment_signal(trial_clean, segment_samples)
 
         if segs.shape[0] == 0:
@@ -139,34 +128,42 @@ def load_deap_subject(
 
         raw_score = float(raw_labels[trial_idx, label_col])
         label     = 1 if raw_score > cfg.ground_truth_threshold else 0
+        clip_id   = clip_id_offset + trial_idx   # unique per DEAP trial
 
         all_segs.append(segs)
-        all_labels.extend([label] * segs.shape[0])
+        all_labels.extend([label]   * segs.shape[0])
+        all_clip_ids.extend([clip_id] * segs.shape[0])
 
     if not all_segs:
         logger.warning(f"DEAP subject {subject_id:02d}: no segments produced")
         empty = np.empty((0, _N_EEG_CHANNELS, segment_samples), dtype=np.float32)
-        return empty, np.empty((0,), dtype=np.int64)
+        return empty, np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
 
-    segments = np.concatenate(all_segs, axis=0)
-    labels   = np.array(all_labels, dtype=np.int64)
+    segments  = np.concatenate(all_segs, axis=0)
+    labels    = np.array(all_labels,   dtype=np.int64)
+    clip_ids  = np.array(all_clip_ids, dtype=np.int64)
     logger.info(f"DEAP subject {subject_id:02d}: {segments.shape[0]} segments | "
+                f"{len(np.unique(clip_ids))} clips | "
                 f"class dist {np.bincount(labels).tolist()}")
-    return segments, labels
+    return segments, labels, clip_ids
 
 
-def load_deap_all_subjects(cfg: BIHGCNConfig) -> Tuple[np.ndarray, np.ndarray]:
+def load_deap_all_subjects(cfg: BIHGCNConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     ids = get_deap_subject_ids(cfg)
-    all_segs, all_labels = [], []
+    all_segs, all_labels, all_clip_ids = [], [], []
+    clip_offset = 0
     for sid in ids:
-        segs, labels = load_deap_subject(sid, cfg)
+        segs, labels, clip_ids = load_deap_subject(sid, cfg, clip_id_offset=clip_offset)
         if segs.shape[0]:
             all_segs.append(segs)
             all_labels.append(labels)
+            all_clip_ids.append(clip_ids)
+            clip_offset = int(clip_ids.max()) + 1   # next subject's clips start after this
     if not all_segs:
         raise RuntimeError("No DEAP segments loaded — check data_path.")
-    return (np.concatenate(all_segs,   axis=0),
-            np.concatenate(all_labels, axis=0))
+    return (np.concatenate(all_segs,     axis=0),
+            np.concatenate(all_labels,   axis=0),
+            np.concatenate(all_clip_ids, axis=0))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -244,8 +241,8 @@ def _emog_read_json(fpath: str) -> Optional[np.ndarray]:
     if len(tp9) == 0:
         return None
 
-    signal  = np.stack([tp9, af7, af8, tp10], axis=1).T.astype(np.float32)
-    signal -= signal.mean(axis=1, keepdims=True)
+    signal = np.stack([tp9, af7, af8, tp10], axis=1).T.astype(np.float32)
+    # ⚠️  NO DC removal (signal -= mean) here — normalisation happens after split in train.py
     return signal   # [4, T]
 
 
@@ -290,7 +287,8 @@ def _emog_find_trials(subject_id: str, cfg: BIHGCNConfig) -> List[Tuple[str, int
 def load_emognition_subject(
     subject_id: str,
     cfg: BIHGCNConfig,
-) -> Tuple[np.ndarray, np.ndarray]:
+    clip_id_offset: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     srate            = 256
     segment_samples  = cfg.segment_samples
     lead_in_samples  = int(cfg.lead_in_duration  * srate)
@@ -302,10 +300,11 @@ def load_emognition_subject(
     if not trial_files:
         logger.warning(f"Emognition: no trials found for subject '{subject_id}'")
         empty = np.empty((0, 4, segment_samples), dtype=np.float32)
-        return empty, np.empty((0,), dtype=np.int64)
+        return empty, np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
 
-    all_segs, all_labels = [], []
-    skipped = 0
+    all_segs, all_labels, all_clip_ids = [], [], []
+    skipped  = 0
+    local_clip_id = clip_id_offset   # each JSON file = one clip
 
     for fpath, label in trial_files:
         fname  = os.path.basename(fpath)
@@ -332,8 +331,8 @@ def load_emognition_subject(
             skipped += 1
             continue
 
-        clean = _zscore_1d(clean)
-        segs  = _segment_signal(clean, segment_samples)
+        # ⚠️  NO _zscore_1d here — normalisation happens after split in train.py
+        segs = _segment_signal(clean, segment_samples)
 
         if segs.shape[0] == 0:
             logger.warning(f"  Skipping {fname}: 0 segments produced")
@@ -341,36 +340,45 @@ def load_emognition_subject(
             continue
 
         all_segs.append(segs)
-        all_labels.extend([label] * segs.shape[0])
-        logger.debug(f"  {subject_id} | {fname} | label={label} | segs={segs.shape[0]}")
+        all_labels.extend([label]          * segs.shape[0])
+        all_clip_ids.extend([local_clip_id] * segs.shape[0])  # all segs of this file share one clip id
+        local_clip_id += 1                                      # next file = new clip id
+
+        logger.debug(f"  {subject_id} | {fname} | clip_id={local_clip_id-1} | "
+                     f"label={label} | segs={segs.shape[0]}")
 
     if not all_segs:
         empty = np.empty((0, 4, segment_samples), dtype=np.float32)
-        return empty, np.empty((0,), dtype=np.int64)
+        return empty, np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
 
-    segments = np.concatenate(all_segs, axis=0)
-    labels   = np.array(all_labels, dtype=np.int64)
+    segments  = np.concatenate(all_segs, axis=0)
+    labels    = np.array(all_labels,   dtype=np.int64)
+    clip_ids  = np.array(all_clip_ids, dtype=np.int64)
     logger.info(
         f"Emognition subject {subject_id}: {segments.shape[0]} segments | "
-        f"{skipped} skipped | "
+        f"{len(np.unique(clip_ids))} clips | {skipped} skipped | "
         f"class dist {np.bincount(labels, minlength=cfg.n_classes).tolist()}"
     )
-    return segments, labels
+    return segments, labels, clip_ids
 
 
-def load_emognition_all_subjects(cfg: BIHGCNConfig) -> Tuple[np.ndarray, np.ndarray]:
+def load_emognition_all_subjects(cfg: BIHGCNConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     ids = get_emognition_subject_ids(cfg)
     logger.info(f"Found {len(ids)} Emognition subjects: {ids}")
-    all_segs, all_labels = [], []
+    all_segs, all_labels, all_clip_ids = [], [], []
+    clip_offset = 0
     for sid in ids:
-        segs, labels = load_emognition_subject(sid, cfg)
+        segs, labels, clip_ids = load_emognition_subject(sid, cfg, clip_id_offset=clip_offset)
         if segs.shape[0]:
             all_segs.append(segs)
             all_labels.append(labels)
+            all_clip_ids.append(clip_ids)
+            clip_offset = int(clip_ids.max()) + 1   # next subject's clips start after this
     if not all_segs:
         raise RuntimeError("No Emognition segments loaded — check data_path.")
-    return (np.concatenate(all_segs,   axis=0),
-            np.concatenate(all_labels, axis=0))
+    return (np.concatenate(all_segs,     axis=0),
+            np.concatenate(all_labels,   axis=0),
+            np.concatenate(all_clip_ids, axis=0))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -380,9 +388,9 @@ def load_emognition_all_subjects(cfg: BIHGCNConfig) -> Tuple[np.ndarray, np.ndar
 def load_data(
     cfg: BIHGCNConfig,
     subject_id=None,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load EEG segments and labels for the configured dataset.
+    Load EEG segments, labels, and clip_ids for the configured dataset.
 
     Args:
         cfg        : BIHGCNConfig
@@ -391,20 +399,25 @@ def load_data(
     Returns:
         segments : [N, C, T]  float32
         labels   : [N]        int64
+        clip_ids : [N]        int64  — all segments from the same recording
+                                       share the same clip_id. Used to split
+                                       at the CLIP level in train.py.
     """
     is_emog = cfg.dataset.lower() == "emognition"
 
     if subject_id is not None:
         if is_emog:
-            segments, labels = load_emognition_subject(str(subject_id), cfg)
+            segments, labels, clip_ids = load_emognition_subject(str(subject_id), cfg)
         else:
-            segments, labels = load_deap_subject(int(subject_id), cfg)
+            segments, labels, clip_ids = load_deap_subject(int(subject_id), cfg)
     else:
         if is_emog:
-            segments, labels = load_emognition_all_subjects(cfg)
+            segments, labels, clip_ids = load_emognition_all_subjects(cfg)
         else:
-            segments, labels = load_deap_all_subjects(cfg)
+            segments, labels, clip_ids = load_deap_all_subjects(cfg)
 
-    logger.info(f"Total: {len(segments)} segments | shape={segments.shape} | "
+    n_clips = len(np.unique(clip_ids))
+    logger.info(f"Total: {len(segments)} segments | {n_clips} clips | "
+                f"shape={segments.shape} | "
                 f"class dist={np.bincount(labels, minlength=cfg.n_classes).tolist()}")
-    return segments, labels
+    return segments, labels, clip_ids

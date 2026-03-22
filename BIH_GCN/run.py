@@ -143,14 +143,14 @@ def main():
     else:
         logger.info("Loading ALL subjects …")
 
-    segments, labels = load_data(cfg, subject_id=subject_id)
+    segments, labels, clip_ids = load_data(cfg, subject_id=subject_id)
 
     if segments.shape[0] == 0:
         logger.error("No data loaded — check --data_path and subject id.")
         return
 
     # ── Run evaluation ────────────────────────────────────────────────────────
-    summary = run_evaluation(segments, labels, cfg)
+    summary = run_evaluation(segments, labels, clip_ids, cfg)
 
     # ── Save results ──────────────────────────────────────────────────────────
     os.makedirs(cfg.log_dir, exist_ok=True)
