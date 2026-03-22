@@ -11,9 +11,10 @@ Standalone test script for the BIH-GCN EEG pipeline on the Emognition dataset.
 
 Pipeline:
   1. Load raw EEG  → shape (N, 4, samples)
-  2. Re-window to 512 samples (4 s @ 128 Hz) if loader returns longer segments
+  2. Segments are 1536 samples (6 s @ 256 Hz) — native Emognition rate
   3. Bandpass 1–50 Hz + 50 Hz notch + per-channel z-score normalisation
   4. STFT spectrogram → (batch, 4, freq_bins, time_frames)
+       n_fft=128, hop=32  →  (65 freq × 45 time frames)
   5. CNN encoder     → (batch, 128) per channel
   6. BIH-GCN
        • Local graph  : intra-region GCN + attention pooling
@@ -21,6 +22,8 @@ Pipeline:
   7. FC head         → 4-class softmax
   8. Loss            : 0.9 × weighted-CE  +  0.1 × focal loss
   9. Evaluate with accuracy + macro-F1 over 30 random 80/20 splits
+     Checkpoint selection uses a held-out VAL set (10% of train trials),
+     NOT the test set.
 
 Usage
 -----
@@ -85,8 +88,8 @@ logger = logging.getLogger("BIH-GCN.Test")
 #  CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-FS             = 128          # Emognition sampling rate
-SEG_SAMPLES    = 512          # 4 s × 128 Hz
+FS             = 256          # Emognition Muse headset sampling rate (correct)
+SEG_SAMPLES    = 1536         # 6 s × 256 Hz  (matches loader's segment_duration=6s)
 N_CHANNELS     = 4
 N_CLASSES      = 4
 EMOTION_NAMES  = ["enthusiasm", "neutral", "fear", "sadness"]
@@ -96,9 +99,12 @@ EMOTION_NAMES  = ["enthusiasm", "neutral", "fear", "sadness"]
 FRONTAL_CH  = [0, 1]
 TEMPORAL_CH = [2, 3]
 
-STFT_N_FFT      = 256
-STFT_HOP        = 128
-FREQ_BINS       = STFT_N_FFT // 2 + 1   # 129
+# STFT parameters — chosen to give ~45 time frames from 1536-sample segments:
+#   time_frames = (1536 - 128) // 32 + 1 = 45
+#   freq_bins   = 128 // 2 + 1          = 65
+STFT_N_FFT      = 128
+STFT_HOP        = 32
+FREQ_BINS       = STFT_N_FFT // 2 + 1   # 65
 CNN_EMBED_DIM   = 128
 GCN_HIDDEN      = 64
 
@@ -461,7 +467,7 @@ def load_emognition_data(data_path: str,
     Load raw Emognition EEG.
     Falls back to dummy data if the weave_pipeline loader is unavailable
     or the data path does not exist.
-    Returns (segments [N,4,512], labels [N], trial_ids [N]).
+    Returns (segments [N,4,SEG_SAMPLES], labels [N], trial_ids [N]).
     """
     if not _HAS_WEAVE or not os.path.isdir(data_path):
         logger.warning("Real data unavailable – using DUMMY data for smoke-test.")
@@ -470,11 +476,11 @@ def load_emognition_data(data_path: str,
     cfg = WEAVEConfig(
         dataset            = "emognition",
         data_path          = data_path,
-        sampling_rate      = FS,
+        sampling_rate      = FS,                  # ← 256 Hz (correct)
         n_eeg_channels     = N_CHANNELS,
         n_classes          = N_CLASSES,
         class_names        = EMOTION_NAMES,
-        segment_duration   = SEG_SAMPLES / FS,
+        segment_duration   = SEG_SAMPLES / FS,    # ← 6.0 s
         lead_in_duration   = lead_in,
         baseline_duration  = baseline_dur,
     )
@@ -494,7 +500,7 @@ def load_emognition_data(data_path: str,
             raw_segs[valid_mask], raw_labels[valid_mask], trial_ids[valid_mask]
         )
 
-    # ── Re-window to SEG_SAMPLES if the loader returned longer segments ───────
+    # ── Re-window to SEG_SAMPLES if the loader returned different-length segments ──
     raw_segs, raw_labels, trial_ids = _rewindow(raw_segs, raw_labels, trial_ids)
 
     # ── Preprocess each segment ───────────────────────────────────────────────
@@ -562,6 +568,8 @@ def run_evaluation(spectrograms: np.ndarray,
                    device) -> dict:
     """
     30 × stratified 80/20 train/test splits (trial-level).
+    Within each split, 10% of train trials are held out as a validation set
+    for checkpoint selection — the test set is NEVER seen during training.
     Returns summary dict with mean/std of acc and F1.
     """
     N, C, Freq, Time = spectrograms.shape
@@ -570,39 +578,65 @@ def run_evaluation(spectrograms: np.ndarray,
     unique_trials = np.unique(trial_ids)
     trial_labels  = np.array([labels[trial_ids == tid][0] for tid in unique_trials])
 
+    # Outer split: 80% train+val trials / 20% test trials
     sss = StratifiedShuffleSplit(
-        n_splits   = args.n_reps,
-        test_size  = args.test_size,
+        n_splits     = args.n_reps,
+        test_size    = args.test_size,
+        random_state = args.seed,
+    )
+    # Inner split: carve 10% of train trials as val (for checkpoint selection)
+    inner_sss = StratifiedShuffleSplit(
+        n_splits     = 1,
+        test_size    = 0.125,   # 10% of total ≈ 10/80 of train portion
         random_state = args.seed,
     )
 
-    full_accs, red_accs   = [], []
-    full_f1s,  red_f1s    = [], []
+    full_accs = []
+    full_f1s  = []
 
     for rep, (tr_tidx, te_tidx) in enumerate(sss.split(unique_trials, trial_labels)):
-        tr_tids = unique_trials[tr_tidx]
-        te_tids = unique_trials[te_tidx]
+        tr_tids_all = unique_trials[tr_tidx]
+        te_tids     = unique_trials[te_tidx]
+        tr_labels_all = trial_labels[tr_tidx]
 
-        tr_mask = np.isin(trial_ids, tr_tids)
-        te_mask = np.isin(trial_ids, te_tids)
+        # ── Inner val split (from train trials only) ──────────────────────────
+        try:
+            tr_inner_idx, val_inner_idx = next(
+                inner_sss.split(tr_tids_all, tr_labels_all)
+            )
+            tr_tids  = tr_tids_all[tr_inner_idx]
+            val_tids = tr_tids_all[val_inner_idx]
+        except ValueError:
+            # Fallback: not enough trials per class for inner split — use all train
+            tr_tids  = tr_tids_all
+            val_tids = tr_tids_all
 
-        X_tr, y_tr = spectrograms[tr_mask], labels[tr_mask]
-        X_te, y_te = spectrograms[te_mask], labels[te_mask]
+        tr_mask  = np.isin(trial_ids, tr_tids)
+        val_mask = np.isin(trial_ids, val_tids)
+        te_mask  = np.isin(trial_ids, te_tids)
+
+        X_tr,  y_tr  = spectrograms[tr_mask],  labels[tr_mask]
+        X_val, y_val = spectrograms[val_mask],  labels[val_mask]
+        X_te,  y_te  = spectrograms[te_mask],   labels[te_mask]
 
         cw = compute_class_weights(y_tr, N_CLASSES, device)
 
         # ── Tensors ───────────────────────────────────────────────────────────
-        tr_ds = TensorDataset(
-            torch.tensor(X_tr, dtype=torch.float32),
-            torch.tensor(y_tr, dtype=torch.long),
+        tr_loader  = DataLoader(
+            TensorDataset(torch.tensor(X_tr,  dtype=torch.float32),
+                          torch.tensor(y_tr,  dtype=torch.long)),
+            batch_size=args.batch_size, shuffle=True, drop_last=False,
         )
-        te_ds = TensorDataset(
-            torch.tensor(X_te, dtype=torch.float32),
-            torch.tensor(y_te, dtype=torch.long),
+        val_loader = DataLoader(
+            TensorDataset(torch.tensor(X_val, dtype=torch.float32),
+                          torch.tensor(y_val, dtype=torch.long)),
+            batch_size=args.batch_size, shuffle=False,
         )
-        tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,
-                               drop_last=False)
-        te_loader = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False)
+        te_loader  = DataLoader(
+            TensorDataset(torch.tensor(X_te,  dtype=torch.float32),
+                          torch.tensor(y_te,  dtype=torch.long)),
+            batch_size=args.batch_size, shuffle=False,
+        )
 
         # ── Model ─────────────────────────────────────────────────────────────
         model = BIHGCN(
@@ -621,12 +655,13 @@ def run_evaluation(spectrograms: np.ndarray,
             optimizer, T_max=args.epochs, eta_min=1e-6
         )
 
-        best_val_acc  = 0.0
-        best_state    = None
+        best_val_acc = 0.0
+        best_state   = None
 
         for epoch in range(1, args.epochs + 1):
             tr_loss = train_one_epoch(model, tr_loader, optimizer, cw, device)
-            val_acc, _ = evaluate(model, te_loader, device)
+            # ── Checkpoint selection on VAL set (not test set) ────────────────
+            val_acc, _ = evaluate(model, val_loader, device)
             scheduler.step()
 
             if val_acc > best_val_acc:
@@ -640,7 +675,7 @@ def run_evaluation(spectrograms: np.ndarray,
                     f"loss={tr_loss:.4f}  val_acc={val_acc:.4f}"
                 )
 
-        # ── Best checkpoint evaluation ────────────────────────────────────────
+        # ── Evaluate best checkpoint on the held-out TEST set ─────────────────
         if best_state is not None:
             model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
         acc, f1 = evaluate(model, te_loader, device)
@@ -648,7 +683,9 @@ def run_evaluation(spectrograms: np.ndarray,
         full_f1s.append(f1)
 
         logger.info(
-            f"  ── Rep {rep+1:02d} FINAL  acc={acc:.4f}  macro-F1={f1:.4f}"
+            f"  ── Rep {rep+1:02d} FINAL  "
+            f"test_acc={acc:.4f}  macro-F1={f1:.4f}  "
+            f"(best_val_acc={best_val_acc:.4f})"
         )
 
     summary = {
