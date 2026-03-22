@@ -568,13 +568,13 @@ def run_evaluation(spectrograms: np.ndarray,
                    device) -> dict:
     """
     30 × stratified 80/20 train/test splits (trial-level).
-    Within each split, 10% of train trials are held out as a validation set
-    for checkpoint selection — the test set is NEVER seen during training.
+    Within each split, 20% of train trials are held out as a validation set
+    for checkpoint selection (early stopping) — the test set is NEVER seen
+    during training.
     Returns summary dict with mean/std of acc and F1.
     """
     N, C, Freq, Time = spectrograms.shape
 
-    # ── Trial-level split indices ─────────────────────────────────────────────
     unique_trials = np.unique(trial_ids)
     trial_labels  = np.array([labels[trial_ids == tid][0] for tid in unique_trials])
 
@@ -584,22 +584,21 @@ def run_evaluation(spectrograms: np.ndarray,
         test_size    = args.test_size,
         random_state = args.seed,
     )
-    # Inner split: carve 10% of train trials as val (for checkpoint selection)
-    inner_sss = StratifiedShuffleSplit(
-        n_splits     = 1,
-        test_size    = 0.125,   # 10% of total ≈ 10/80 of train portion
-        random_state = args.seed,
-    )
 
     full_accs = []
     full_f1s  = []
 
     for rep, (tr_tidx, te_tidx) in enumerate(sss.split(unique_trials, trial_labels)):
-        tr_tids_all = unique_trials[tr_tidx]
-        te_tids     = unique_trials[te_tidx]
+        tr_tids_all   = unique_trials[tr_tidx]
+        te_tids       = unique_trials[te_tidx]
         tr_labels_all = trial_labels[tr_tidx]
 
-        # ── Inner val split (from train trials only) ──────────────────────────
+        # ── Inner val split — use rep-specific seed so each rep gets different val trials
+        inner_sss = StratifiedShuffleSplit(
+            n_splits     = 1,
+            test_size    = 0.20,              # 20% of train trials → val
+            random_state = args.seed + rep,   # ← different each rep
+        )
         try:
             tr_inner_idx, val_inner_idx = next(
                 inner_sss.split(tr_tids_all, tr_labels_all)
@@ -607,7 +606,6 @@ def run_evaluation(spectrograms: np.ndarray,
             tr_tids  = tr_tids_all[tr_inner_idx]
             val_tids = tr_tids_all[val_inner_idx]
         except ValueError:
-            # Fallback: not enough trials per class for inner split — use all train
             tr_tids  = tr_tids_all
             val_tids = tr_tids_all
 
@@ -619,9 +617,13 @@ def run_evaluation(spectrograms: np.ndarray,
         X_val, y_val = spectrograms[val_mask],  labels[val_mask]
         X_te,  y_te  = spectrograms[te_mask],   labels[te_mask]
 
+        logger.info(
+            f"  Rep {rep+1:02d}  "
+            f"train={len(y_tr)} val={len(y_val)} test={len(y_te)} segments"
+        )
+
         cw = compute_class_weights(y_tr, N_CLASSES, device)
 
-        # ── Tensors ───────────────────────────────────────────────────────────
         tr_loader  = DataLoader(
             TensorDataset(torch.tensor(X_tr,  dtype=torch.float32),
                           torch.tensor(y_tr,  dtype=torch.long)),
@@ -634,11 +636,10 @@ def run_evaluation(spectrograms: np.ndarray,
         )
         te_loader  = DataLoader(
             TensorDataset(torch.tensor(X_te,  dtype=torch.float32),
-                          torch.tensor(y_te,  dtype=torch.long)),
+                          torch.tensor(y_te, dtype=torch.long)),
             batch_size=args.batch_size, shuffle=False,
         )
 
-        # ── Model ─────────────────────────────────────────────────────────────
         model = BIHGCN(
             freq_bins   = Freq,
             time_frames = Time,
@@ -649,33 +650,44 @@ def run_evaluation(spectrograms: np.ndarray,
         ).to(device)
 
         optimizer = torch.optim.Adam(
-            model.parameters(), lr=args.lr, weight_decay=1e-4
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs, eta_min=1e-6
         )
 
-        best_val_acc = 0.0
-        best_state   = None
+        best_val_acc    = 0.0
+        best_state      = None
+        patience_count  = 0
 
         for epoch in range(1, args.epochs + 1):
             tr_loss = train_one_epoch(model, tr_loader, optimizer, cw, device)
-            # ── Checkpoint selection on VAL set (not test set) ────────────────
             val_acc, _ = evaluate(model, val_loader, device)
             scheduler.step()
 
             if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_state   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_val_acc   = val_acc
+                best_state     = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                patience_count = 0
+            else:
+                patience_count += 1
 
             if epoch % 20 == 0 or epoch == args.epochs:
                 logger.info(
                     f"  Rep {rep+1:02d}/{args.n_reps}  "
                     f"Epoch {epoch:03d}/{args.epochs}  "
-                    f"loss={tr_loss:.4f}  val_acc={val_acc:.4f}"
+                    f"loss={tr_loss:.4f}  val_acc={val_acc:.4f}  "
+                    f"patience={patience_count}/{args.patience}"
                 )
 
-        # ── Evaluate best checkpoint on the held-out TEST set ─────────────────
+            # ── Early stopping ────────────────────────────────────────────────
+            if patience_count >= args.patience:
+                logger.info(
+                    f"  Rep {rep+1:02d}  Early stop at epoch {epoch} "
+                    f"(no val improvement for {args.patience} epochs)"
+                )
+                break
+
         if best_state is not None:
             model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
         acc, f1 = evaluate(model, te_loader, device)
@@ -689,12 +701,12 @@ def run_evaluation(spectrograms: np.ndarray,
         )
 
     summary = {
-        "acc_mean"  : float(np.mean(full_accs)),
-        "acc_std"   : float(np.std(full_accs)),
-        "f1_mean"   : float(np.mean(full_f1s)),
-        "f1_std"    : float(np.std(full_f1s)),
-        "all_accs"  : full_accs,
-        "all_f1s"   : full_f1s,
+        "acc_mean" : float(np.mean(full_accs)),
+        "acc_std"  : float(np.std(full_accs)),
+        "f1_mean"  : float(np.mean(full_f1s)),
+        "f1_std"   : float(np.std(full_f1s)),
+        "all_accs" : full_accs,
+        "all_f1s"  : full_f1s,
     }
     return summary
 
@@ -743,34 +755,34 @@ def save_results(summary: dict, path: str, args: argparse.Namespace):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="BIH-GCN – Emognition 5-class emotion recognition",
+        description="BIH-GCN – Emognition 4-class emotion recognition",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    p.add_argument("--data_path",   default="DUMMY",
-                   help="Path to Emognition dataset root. "
-                        "Use 'DUMMY' to run on synthetic data.")
-    p.add_argument("--subject",     default=None,
-                   help="Single subject ID (string).  Omit = all subjects.")
-    p.add_argument("--all_subjects", action="store_true",
-                   help="Pool all subjects (default when --subject omitted).")
-    p.add_argument("--lead_in",     default=5.0,  type=float)
-    p.add_argument("--baseline_dur",default=3.0,  type=float)
+    p.add_argument("--data_path",    default="DUMMY")
+    p.add_argument("--subject",      default=None)
+    p.add_argument("--all_subjects", action="store_true")
+    p.add_argument("--lead_in",      default=5.0,   type=float)
+    p.add_argument("--baseline_dur", default=3.0,   type=float)
     # Training
-    p.add_argument("--epochs",      default=50,   type=int)
-    p.add_argument("--batch_size",  default=16,   type=int)
-    p.add_argument("--lr",          default=1e-4, type=float)
-    p.add_argument("--dropout",     default=0.4,  type=float)
+    p.add_argument("--epochs",        default=150,   type=int,
+                   help="Max epochs per rep (early stopping will cut this short)")
+    p.add_argument("--batch_size",    default=32,    type=int)
+    p.add_argument("--lr",            default=5e-5,  type=float,
+                   help="Lower LR reduces overfitting on small EEG datasets")
+    p.add_argument("--dropout",       default=0.5,   type=float,
+                   help="Higher dropout (0.5) regularises the small dataset")
+    p.add_argument("--weight_decay",  default=1e-3,  type=float,
+                   help="L2 regularisation (1e-3 stronger than default 1e-4)")
+    p.add_argument("--patience",      default=20,    type=int,
+                   help="Early stopping patience in epochs")
     # Evaluation
-    p.add_argument("--n_reps",      default=30,   type=int,
-                   help="Random train/test repetitions (paper: 30)")
-    p.add_argument("--test_size",   default=0.2,  type=float)
-    p.add_argument("--seed",        default=42,   type=int)
+    p.add_argument("--n_reps",       default=30,    type=int)
+    p.add_argument("--test_size",    default=0.2,   type=float)
+    p.add_argument("--seed",         default=42,    type=int)
     # Output
-    p.add_argument("--log_dir",     default="weave_logs/",
-                   help="Directory to write result files")
-    p.add_argument("--device",      default="auto",
+    p.add_argument("--log_dir",      default="weave_logs/")
+    p.add_argument("--device",       default="auto",
                    choices=["auto", "cpu", "cuda", "mps"])
-
     return p.parse_args()
 
 
